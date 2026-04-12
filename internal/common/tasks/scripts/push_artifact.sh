@@ -176,6 +176,7 @@ builder_image_used="$(params.builder-image)"
 aib_version="$(params.aib-version)"
 aib_image="$(params.automotive-image-builder)"
 aib_command="$(params.aib-command)"
+SECURE_BUILD="$(params.secure-build)"
 
 config_file="/etc/target-defaults/target-defaults.yaml"
 default_partitions=""
@@ -194,6 +195,27 @@ fi
 
 cd /workspace/shared
 
+# Verify artifact integrity against the digest produced by the build task.
+EXPECTED_DIGEST="$(params.expected-artifact-digest)"
+if [ -n "$EXPECTED_DIGEST" ]; then
+  echo "=== Artifact Integrity Verification ==="
+  ACTUAL_DIGEST=$(compute_artifact_digest "${parts_dir}" "${exportFile}")
+  if [ -z "$ACTUAL_DIGEST" ]; then
+    echo "WARNING: Cannot verify integrity — artifact not found yet"
+  fi
+  if [ -n "$ACTUAL_DIGEST" ]; then
+    if [ "$EXPECTED_DIGEST" != "$ACTUAL_DIGEST" ]; then
+      echo "ERROR: Artifact integrity check failed!" >&2
+      echo "  Expected: $EXPECTED_DIGEST" >&2
+      echo "  Actual:   $ACTUAL_DIGEST" >&2
+      exit 1
+    fi
+    echo "  Integrity verified: $ACTUAL_DIGEST"
+  fi
+else
+  echo "No artifact integrity digest provided, skipping verification"
+fi
+
 echo "=== Artifact Push Configuration ==="
 echo "  Working directory: $(pwd)"
 echo "  Artifact file:     ${exportFile}"
@@ -206,7 +228,8 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
   echo "Found parts directory: ${parts_dir}"
   echo "Using multi-layer push for individual partition files"
 
-  # For ride4/ridesx4 targets, duplicate boot_a as boot_b so both partitions get flashed
+  # For ride4/ridesx4 targets, ensure boot_b exists (normally created by build task;
+  # kept here as idempotent fallback for backwards compatibility with older bundles)
   case "$target" in
     ride4*|ridesx4*)
       for boot_a_file in "${parts_dir}"/boot_a.*; do
@@ -408,13 +431,18 @@ fi
 # Write Tekton Chains type hint results for disk artifact
 DISK_DIGEST=$(sed -n 's/.*Digest: \(sha256:[a-f0-9]*\).*/\1/p' /tmp/oras-push-output.txt 2>/dev/null | head -1)
 if [ -z "$DISK_DIGEST" ]; then
-  # Fallback: fetch manifest descriptor from registry
-  DISK_DIGEST=$("$HOME/bin/oras" manifest fetch --descriptor "${repo_url}" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('digest',''))" 2>/dev/null || echo "")
+  echo "ERROR: Could not extract digest from oras push output." >&2
+  echo "Push output was:" >&2
+  cat /tmp/oras-push-output.txt >&2
+  exit 1
 fi
 echo -n "${repo_url}" > /tekton/results/IMAGE_URL
 echo -n "${DISK_DIGEST}" > /tekton/results/IMAGE_DIGEST
 echo "Tekton Chains: IMAGE_URL=${repo_url} IMAGE_DIGEST=${DISK_DIGEST}"
+# Write to workspace for cross-task access (avoids Tekton result-ref issues with skipped tasks)
+mkdir -p /workspace/shared/.chains/disk
+echo -n "${repo_url}" > /workspace/shared/.chains/disk/url
+echo -n "${DISK_DIGEST}" > /workspace/shared/.chains/disk/digest
 
 # Attach sanitized osbuild manifest as OCI referrer for supply chain verification.
 # image.json is the fully-resolved osbuild manifest produced by AIB — it contains
@@ -461,11 +489,16 @@ with open(sys.argv[2], "w") as f:
 PYEOF
 
   echo "Attaching sanitized osbuild manifest to ${repo_url}@${DISK_DIGEST}"
-  "$HOME/bin/oras" attach \
+  if ! "$HOME/bin/oras" attach \
     --artifact-type "application/vnd.osbuild.manifest.v1+json" \
     "${repo_url}@${DISK_DIGEST}" \
-    "${SANITIZED_MANIFEST}:application/vnd.osbuild.manifest.v1+json" 2>&1 || \
+    "${SANITIZED_MANIFEST}:application/vnd.osbuild.manifest.v1+json" 2>&1; then
+    if [ "$SECURE_BUILD" = "true" ]; then
+      echo "ERROR: Failed to attach osbuild manifest (fatal in secure build mode)"
+      exit 1
+    fi
     echo "WARNING: Failed to attach osbuild manifest — registry may not support OCI referrers (non-fatal)"
+  fi
 
   rm -f "$SANITIZED_MANIFEST"
 else

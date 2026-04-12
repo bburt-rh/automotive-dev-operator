@@ -14,11 +14,15 @@ umask 0077
 
 setup_cluster_auth
 
-# Initialize Tekton Chains type hint results with empty defaults.
+# Initialize Tekton results with empty defaults.
 # Tekton requires all declared results to exist; these are overwritten
-# later if a container push actually happens.
+# later when applicable.
 echo -n "" > /tekton/results/IMAGE_URL
 echo -n "" > /tekton/results/IMAGE_DIGEST
+echo -n "" > /tekton/results/ARTIFACT_INTEGRITY_DIGEST
+
+# Clear stale Chains result files from previous builds on reused workspace PVCs.
+rm -rf "$WORKSPACE_PATH/.chains"
 
 # Read registry credentials from workspace and set up auth
 read_registry_creds "/workspace/registry-auth"
@@ -748,6 +752,35 @@ else
   echo "Warning: final_name is empty, no artifact filename will be recorded"
 fi
 
+# Compute artifact integrity digest for cross-task verification.
+# Covers both multi-layer (parts directory) and single-file modes.
+if [ -n "$final_name" ] && [ "$final_name" != "container:$CONTAINER_PUSH" ]; then
+  parts_dir="$WORKSPACE_PATH/${final_name}-parts"
+
+  # For ride4/ridesx4 targets, duplicate boot_a as boot_b BEFORE computing the
+  # integrity digest so the digest covers the complete artifact that will be pushed.
+  if [ -d "$parts_dir" ]; then
+    case "$(params.target)" in
+      ride4*|ridesx4*)
+        for boot_a_file in "${parts_dir}"/boot_a.*; do
+          [ -f "$boot_a_file" ] || continue
+          boot_b_file=$(echo "$boot_a_file" | sed 's/boot_a/boot_b/')
+          if [ ! -f "$boot_b_file" ]; then
+            echo "Duplicating $(basename "$boot_a_file") as $(basename "$boot_b_file") for target $(params.target)"
+            cp "$boot_a_file" "$boot_b_file"
+          fi
+        done
+        ;;
+    esac
+  fi
+
+  ARTIFACT_DIGEST=$(compute_artifact_digest "$parts_dir" "$WORKSPACE_PATH/$final_name")
+  if [ -n "$ARTIFACT_DIGEST" ]; then
+    echo "Artifact integrity digest: $ARTIFACT_DIGEST"
+    echo -n "$ARTIFACT_DIGEST" > /tekton/results/ARTIFACT_INTEGRITY_DIGEST
+  fi
+fi
+
 # Wait for background container push to complete (bootc mode only)
 if [ -n "${CONTAINER_PUSH_PID:-}" ]; then
   echo "Waiting for container push to complete..."
@@ -763,6 +796,10 @@ if [ -n "${CONTAINER_PUSH:-}" ]; then
   echo -n "$CONTAINER_PUSH" > /tekton/results/IMAGE_URL
   echo -n "$PUSHED_DIGEST" > /tekton/results/IMAGE_DIGEST
   echo "Tekton Chains: IMAGE_URL=$CONTAINER_PUSH IMAGE_DIGEST=$PUSHED_DIGEST"
+  # Write to workspace for cross-task access (avoids Tekton result-ref issues with skipped tasks)
+  mkdir -p "$WORKSPACE_PATH/.chains/container"
+  echo -n "$CONTAINER_PUSH" > "$WORKSPACE_PATH/.chains/container/url"
+  echo -n "$PUSHED_DIGEST" > "$WORKSPACE_PATH/.chains/container/digest"
 fi
 
 BUILD_END_TIME=$(date +%s)
