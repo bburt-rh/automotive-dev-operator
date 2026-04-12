@@ -140,11 +140,13 @@ const workspaceNameShared = "shared-workspace"
 // Tekton resolves this at runtime to the actual volume name in the pod spec.
 const workspaceVolumeRef = "$(workspaces." + workspaceNameShared + ".volume)"
 
-const defaultTrustedCABundleConfigMap = "rhivos-ca-bundle"
+// DefaultTrustedCABundleConfigMap is the default ConfigMap name for trusted CA bundles.
+// Exported so the controller can detect divergence when using bundle-resolved tasks.
+const DefaultTrustedCABundleConfigMap = "rhivos-ca-bundle"
 
 func trustedCABundleVolumeSource(buildConfig *BuildConfig) corev1.VolumeSource {
 	kind := "ConfigMap"
-	name := defaultTrustedCABundleConfigMap
+	name := DefaultTrustedCABundleConfigMap
 	optional := true
 	if buildConfig != nil {
 		// Explicit trusted CA configuration should fail fast when missing.
@@ -275,6 +277,24 @@ func GeneratePushArtifactRegistryTask(namespace string, buildConfig *BuildConfig
 						StringVal: "",
 					},
 				},
+				{
+					Name:        "secure-build",
+					Type:        tektonv1.ParamTypeString,
+					Description: "When true, attestation failures (e.g. oras attach) are fatal instead of best-effort",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: "false",
+					},
+				},
+				{
+					Name:        "yq-helper-image",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Container image for yq helper steps",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getYQHelperImage(),
+					},
+				},
 			},
 			Results: []tektonv1.TaskResult{
 				{
@@ -296,7 +316,7 @@ func GeneratePushArtifactRegistryTask(namespace string, buildConfig *BuildConfig
 			Steps: []tektonv1.Step{
 				{
 					Name:  "push-artifact",
-					Image: buildConfig.getYQHelperImage(),
+					Image: "$(params.yq-helper-image)",
 					Env: []corev1.EnvVar{
 						{
 							Name:  "DOCKER_CONFIG",
@@ -485,6 +505,15 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 						StringVal: "false",
 					},
 				},
+				{
+					Name:        "yq-helper-image",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Container image for yq helper steps",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getYQHelperImage(),
+					},
+				},
 			},
 			Results: []tektonv1.TaskResult{
 				{
@@ -549,7 +578,7 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 			Steps: []tektonv1.Step{
 				{
 					Name:   "find-manifest-file",
-					Image:  buildConfig.getYQHelperImage(),
+					Image:  "$(params.yq-helper-image)",
 					Script: FindManifestScript,
 					VolumeMounts: []corev1.VolumeMount{
 						{
@@ -829,6 +858,15 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					Description: "automotive-image-builder container image to use for building",
 				},
 				{
+					Name: "yq-helper-image",
+					Type: tektonv1.ParamTypeString,
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getYQHelperImage(),
+					},
+					Description: "Container image for yq helper steps",
+				},
+				{
 					Name:        "secret-ref",
 					Type:        tektonv1.ParamTypeString,
 					Description: "Secret reference for registry credentials",
@@ -968,6 +1006,15 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					Name:        "use-persistent-cache",
 					Type:        tektonv1.ParamTypeString,
 					Description: "Use persistent build cache on the shared workspace PVC (true/false)",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: "false",
+					},
+				},
+				{
+					Name:        "secure-build",
+					Type:        tektonv1.ParamTypeString,
+					Description: "When true, attestation failures are fatal (true/false)",
 					Default: &tektonv1.ParamValue{
 						Type:      tektonv1.ParamTypeString,
 						StringVal: "false",
@@ -1141,6 +1188,13 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 								StringVal: "$(params.use-persistent-cache)",
 							},
 						},
+						{
+							Name: "yq-helper-image",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(params.yq-helper-image)",
+							},
+						},
 					},
 					Workspaces: []tektonv1.WorkspacePipelineTaskBinding{
 						{Name: workspaceNameShared, Workspace: workspaceNameShared},
@@ -1235,6 +1289,20 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 							Value: tektonv1.ParamValue{
 								Type:      tektonv1.ParamTypeString,
 								StringVal: "$(tasks.build-image.results.ARTIFACT_INTEGRITY_DIGEST)",
+							},
+						},
+						{
+							Name: "secure-build",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(params.secure-build)",
+							},
+						},
+						{
+							Name: "yq-helper-image",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(params.yq-helper-image)",
 							},
 						},
 					},

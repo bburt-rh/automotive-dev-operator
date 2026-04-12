@@ -64,6 +64,18 @@ type ImageBuildSpec struct {
 	// on completion so subsequent builds can reuse it.
 	// +optional
 	Workspace string `json:"workspace,omitempty"`
+
+	// SecureBuild enables supply chain security for this build.
+	// When true, pipeline tasks are resolved from the signed Tekton Bundle
+	// specified in TaskBundleRef instead of cluster-installed tasks.
+	// +optional
+	SecureBuild bool `json:"secureBuild,omitempty"`
+
+	// TaskBundleRef is the digest-pinned OCI reference to the Tekton Bundle
+	// used for this build. Set automatically by the Build API from the
+	// OperatorConfig at request time to prevent TOCTOU races.
+	// +optional
+	TaskBundleRef string `json:"taskBundleRef,omitempty"`
 }
 
 // FlashSpec defines configuration for flashing images to hardware via Jumpstarter

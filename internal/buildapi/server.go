@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1936,6 +1937,26 @@ func buildAIBSpec(req *BuildRequest, manifest, manifestFileName string, inputFil
 	}
 }
 
+// digestPinnedRef matches an OCI reference with a sha256 digest: image@sha256:<64 hex chars>
+var digestPinnedRef = regexp.MustCompile(`^.+@sha256:[a-fA-F0-9]{64}$`)
+
+// validateSecureBuild checks that the OperatorConfig has a valid digest-pinned taskBundleRef.
+// Returns the validated ref, an HTTP status code, and error.
+func validateSecureBuild(ctx context.Context, k8sClient client.Client, namespace string) (string, int, error) {
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: "config", Namespace: namespace}, operatorConfig); err != nil {
+		return "", http.StatusInternalServerError, fmt.Errorf("secureBuild requested but OperatorConfig could not be read: %v", err)
+	}
+	if operatorConfig.Spec.OSBuilds == nil || operatorConfig.Spec.OSBuilds.TaskBundleRef == "" {
+		return "", http.StatusBadRequest, fmt.Errorf("secureBuild requested but OperatorConfig.spec.osBuilds.taskBundleRef is not set")
+	}
+	ref := strings.TrimSpace(operatorConfig.Spec.OSBuilds.TaskBundleRef)
+	if !digestPinnedRef.MatchString(ref) {
+		return "", http.StatusBadRequest, fmt.Errorf("secureBuild requires a digest-pinned taskBundleRef (must match image@sha256:<64 hex>), got %q", ref)
+	}
+	return ref, 0, nil
+}
+
 func (a *APIServer) createBuild(c *gin.Context) {
 	var req BuildRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1985,6 +2006,19 @@ func (a *APIServer) createBuild(c *gin.Context) {
 	ctx := c.Request.Context()
 	namespace := resolveNamespace()
 	requestedBy := a.resolveRequester(c)
+
+	// Validate secureBuild requirements early, before creating any resources.
+	// Snapshot the validated ref to prevent TOCTOU races with OperatorConfig changes.
+	var taskBundleRef string
+	if req.SecureBuild {
+		var statusCode int
+		var err error
+		taskBundleRef, statusCode, err = validateSecureBuild(ctx, k8sClient, namespace)
+		if err != nil {
+			c.JSON(statusCode, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Resolve --workspace: create/find build-cache PVC, forward lease, start file server
 	var buildCachePVCName string
@@ -2065,6 +2099,8 @@ func (a *APIServer) createBuild(c *gin.Context) {
 			Flash:         flashSpec,
 			BuildCachePVC: buildCachePVCName,
 			Workspace:     req.Workspace,
+			SecureBuild:   req.SecureBuild,
+			TaskBundleRef: taskBundleRef,
 		},
 	}
 	if err := k8sClient.Create(ctx, imageBuild); err != nil {
@@ -2355,6 +2391,7 @@ func getBuildTemplate(c *gin.Context, name string) {
 			CustomDefs:             build.Spec.GetCustomDefs(),
 			AIBExtraArgs:           build.Spec.GetAIBExtraArgs(),
 			Compression:            build.Spec.GetCompression(),
+			SecureBuild:            build.Spec.SecureBuild,
 		},
 		SourceFiles: sourceFiles,
 	})

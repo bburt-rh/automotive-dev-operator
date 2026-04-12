@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -50,6 +51,9 @@ const (
 
 	maxK8sNameLength = 63
 )
+
+// digestPinnedRef matches an OCI reference with a sha256 digest.
+var digestPinnedRef = regexp.MustCompile(`^.+@sha256:[a-fA-F0-9]{64}$`)
 
 const (
 	eventReasonPhaseChanged     = "PhaseChanged"
@@ -505,6 +509,15 @@ func (r *ImageBuildReconciler) startNewBuild(
 	// PVC is now created via VolumeClaimTemplate in createBuildTaskRun
 	// to ensure proper zone affinity with WaitForFirstConsumer
 	if err := r.createBuildTaskRun(ctx, imageBuild); err != nil {
+		// secureBuild validation errors are terminal — set Failed status
+		// instead of returning a reconcile error that causes infinite requeue
+		if strings.Contains(err.Error(), "secureBuild") {
+			msg := fmt.Sprintf("Build configuration error: %v", err)
+			if statusErr := r.updateStatus(ctx, imageBuild, phaseFailed, msg); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, fmt.Errorf("failed to create build task run: %w", err)
 	}
 
@@ -527,6 +540,11 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		return fmt.Errorf("failed to get OperatorConfig configuration: %w", err)
 	}
 
+	// Fail closed: secureBuild must not silently fall back to the cluster pipeline
+	if imageBuild.Spec.SecureBuild && (err != nil || operatorConfig.Spec.OSBuilds == nil) {
+		return fmt.Errorf("secureBuild requested but OperatorConfig or spec.osBuilds is not available")
+	}
+
 	var buildConfig *tasks.BuildConfig
 	if err == nil && operatorConfig.Spec.OSBuilds != nil {
 		// Convert OSBuildsConfig to BuildConfig
@@ -543,9 +561,39 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			UsePVCScratchVolumes:        operatorConfig.Spec.OSBuilds.GetUsePVCScratchVolumes(),
 		}
 		controllerutils.ApplyTrustedCABundleFromOSBuilds(buildConfig, operatorConfig.Spec.OSBuilds)
-	}
-	_ = buildConfig // buildConfig used for RuntimeClassName if needed
+		if imageBuild.Spec.SecureBuild {
+			// Use the digest-pinned ref snapshotted on the CR by the Build API,
+			// not the current OperatorConfig value (which may have changed).
+			ref := strings.TrimSpace(imageBuild.Spec.TaskBundleRef)
+			if ref == "" {
+				return fmt.Errorf("secureBuild requested but taskBundleRef is not set on the ImageBuild")
+			}
+			if !digestPinnedRef.MatchString(ref) {
+				return fmt.Errorf("secureBuild requires a digest-pinned taskBundleRef (must match image@sha256:<64 hex>), got %q", ref)
+			}
+			buildConfig.TaskResolver = tasks.TaskResolverBundle
+			buildConfig.TaskBundleRef = ref
 
+			// Bundle tasks are exported with nil BuildConfig (defaults only).
+			// Reject settings that would silently diverge from the bundle.
+			if buildConfig.TrustedCABundleName != "" && buildConfig.TrustedCABundleName != tasks.DefaultTrustedCABundleConfigMap {
+				return fmt.Errorf("secureBuild: OperatorConfig specifies custom CA bundle %q but bundle tasks use default %q; build a custom bundle or remove the CA override",
+					buildConfig.TrustedCABundleName, tasks.DefaultTrustedCABundleConfigMap)
+			}
+			if buildConfig.TrustedCABundleKind != "" && !strings.EqualFold(buildConfig.TrustedCABundleKind, "ConfigMap") {
+				return fmt.Errorf("secureBuild: OperatorConfig specifies CA bundle kind %q but bundle tasks use ConfigMap; build a custom bundle or remove the CA override",
+					buildConfig.TrustedCABundleKind)
+			}
+			if buildConfig.UseMemoryVolumes {
+				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
+					"OperatorConfig.useMemoryVolumes is enabled but bundle tasks use disk-backed emptyDir; memory volumes will not apply to this build")
+			}
+			if buildConfig.UsePVCScratchVolumes {
+				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
+					"OperatorConfig.usePVCScratchVolumes is enabled but bundle tasks use emptyDir; PVC scratch will not apply to this build")
+			}
+		}
+	}
 	// PVC is created via VolumeClaimTemplate in the PipelineRun workspace binding
 	// to ensure proper zone affinity with WaitForFirstConsumer storage class
 
@@ -646,6 +694,13 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			Value: tektonv1.ParamValue{
 				Type:      tektonv1.ParamTypeString,
 				StringVal: fmt.Sprintf("%t", imageBuild.Spec.BuildCachePVC != ""),
+			},
+		},
+		{
+			Name: "secure-build",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.SecureBuild),
 			},
 		},
 	}
@@ -996,6 +1051,26 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		log.Info("Setting RuntimeClassName from ImageBuild spec", "runtimeClassName", imageBuild.Spec.RuntimeClassName)
 		podTemplate.RuntimeClassName = &imageBuild.Spec.RuntimeClassName
 	}
+	pipelineRunSpec := tektonv1.PipelineRunSpec{
+		Params:     params,
+		Workspaces: pipelineWorkspaces,
+		TaskRunTemplate: tektonv1.PipelineTaskRunTemplate{
+			PodTemplate:        podTemplate,
+			ServiceAccountName: automotivev1alpha1.BuildServiceAccountName,
+		},
+	}
+
+	// When using bundle resolver, embed the pipeline spec inline so task refs
+	// point to the signed bundle. Otherwise reference the cluster-installed pipeline.
+	if buildConfig != nil && buildConfig.TaskResolver == tasks.TaskResolverBundle {
+		pipeline := tasks.GenerateTektonPipeline("", imageBuild.Namespace, buildConfig)
+		pipelineRunSpec.PipelineSpec = &pipeline.Spec
+	} else {
+		pipelineRunSpec.PipelineRef = &tektonv1.PipelineRef{
+			Name: "automotive-build-pipeline",
+		}
+	}
+
 	pipelineRun := &tektonv1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: safeDerivedName(imageBuild.Name, "-build-"),
@@ -1014,17 +1089,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 				},
 			},
 		},
-		Spec: tektonv1.PipelineRunSpec{
-			PipelineRef: &tektonv1.PipelineRef{
-				Name: "automotive-build-pipeline",
-			},
-			Params:     params,
-			Workspaces: pipelineWorkspaces,
-			TaskRunTemplate: tektonv1.PipelineTaskRunTemplate{
-				PodTemplate:        podTemplate,
-				ServiceAccountName: automotivev1alpha1.BuildServiceAccountName,
-			},
-		},
+		Spec: pipelineRunSpec,
 	}
 
 	if err := r.Create(ctx, pipelineRun); err != nil {
