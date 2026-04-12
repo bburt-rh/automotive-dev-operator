@@ -11,8 +11,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// FindLocalFileReferences extracts manifest add_files source_path references.
-func FindLocalFileReferences(manifestContent string) ([]map[string]string, error) {
+// FindLocalFileReferences extracts manifest add_files source_path and
+// source_glob references. Glob patterns are expanded locally and each
+// matched file is returned as a separate source_path entry.
+// manifestDir is the directory containing the manifest, used to resolve
+// relative glob patterns.
+func FindLocalFileReferences(manifestContent string, manifestDir string) ([]map[string]string, error) {
 	var manifestData map[string]any
 	var localFiles []map[string]string
 
@@ -54,18 +58,39 @@ func FindLocalFileReferences(manifestContent string) ([]map[string]string, error
 
 	processAddFiles := func(addFiles []any) error {
 		for _, file := range addFiles {
-			if fileMap, ok := file.(map[string]any); ok {
-				path, hasPath := fileMap["path"].(string)
-				sourcePath, hasSourcePath := fileMap["source_path"].(string)
-				if hasPath && hasSourcePath {
-					if err := isPathSafe(sourcePath); err != nil {
+			fileMap, ok := file.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			// Handle source_glob entries
+			if sourceGlob, hasGlob := fileMap["source_glob"].(string); hasGlob {
+				matches, err := expandSourceGlob(sourceGlob, manifestDir)
+				if err != nil {
+					return err
+				}
+				for _, m := range matches {
+					if err := isPathSafe(m); err != nil {
 						return err
 					}
 					localFiles = append(localFiles, map[string]string{
-						"path":        path,
-						"source_path": sourcePath,
+						"source_path": m,
 					})
 				}
+				continue
+			}
+
+			// Handle source_path entries
+			path, hasPath := fileMap["path"].(string)
+			sourcePath, hasSourcePath := fileMap["source_path"].(string)
+			if hasPath && hasSourcePath {
+				if err := isPathSafe(sourcePath); err != nil {
+					return err
+				}
+				localFiles = append(localFiles, map[string]string{
+					"path":        path,
+					"source_path": sourcePath,
+				})
 			}
 		}
 		return nil
@@ -89,6 +114,138 @@ func FindLocalFileReferences(manifestContent string) ([]map[string]string, error
 	}
 
 	return localFiles, nil
+}
+
+// expandSourceGlob expands a glob pattern relative to manifestDir and returns
+// the matched file paths (relative to manifestDir if the pattern was relative).
+// Supports ** for recursive directory matching (e.g. "dir/**/*.yaml").
+func expandSourceGlob(pattern string, manifestDir string) ([]string, error) {
+	isAbs := filepath.IsAbs(pattern)
+
+	// Resolve the glob pattern relative to the manifest directory
+	var fullPattern string
+	if isAbs {
+		fullPattern = pattern
+	} else {
+		fullPattern = filepath.Join(manifestDir, pattern)
+	}
+
+	// Use recursive walk for ** patterns since filepath.Glob doesn't support **
+	var matches []string
+	if strings.Contains(fullPattern, "**") {
+		var err error
+		matches, err = expandDoubleStarGlob(fullPattern)
+		if err != nil {
+			return nil, fmt.Errorf("error expanding glob %q: %w", pattern, err)
+		}
+	} else {
+		var err error
+		matches, err = filepath.Glob(fullPattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid glob pattern %q: %w", pattern, err)
+		}
+		// filepath.Glob can return directories; filter to files only
+		matches = filterFiles(matches)
+	}
+
+	// Convert matches to the appropriate path form
+	var files []string
+	for _, m := range matches {
+		if isAbs {
+			files = append(files, m)
+		} else {
+			rel, err := filepath.Rel(manifestDir, m)
+			if err != nil {
+				return nil, fmt.Errorf("error computing relative path for %s: %w", m, err)
+			}
+			files = append(files, rel)
+		}
+	}
+
+	return files, nil
+}
+
+// filterFiles returns only regular files from a list of paths.
+func filterFiles(paths []string) []string {
+	files := make([]string, 0, len(paths))
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		files = append(files, p)
+	}
+	return files
+}
+
+// expandDoubleStarGlob handles glob patterns containing ** by walking the
+// directory tree. It splits the pattern at the first ** segment, walks the
+// base directory recursively, and matches remaining segments against each path.
+// If the prefix before ** contains wildcards, those are expanded first.
+func expandDoubleStarGlob(pattern string) ([]string, error) {
+	// e.g. "/tmp/dir/files/**/*.yaml" -> basePattern="/tmp/dir/files", tail="*.yaml"
+	parts := strings.SplitN(pattern, "**", 2)
+	basePattern := strings.TrimRight(parts[0], string(filepath.Separator))
+	if basePattern == "" {
+		basePattern = "."
+	}
+	tail := ""
+	if len(parts) > 1 {
+		tail = strings.TrimPrefix(parts[1], string(filepath.Separator))
+	}
+
+	// Expand the base if it contains wildcards (e.g. "images/*/**/*.rpm")
+	var bases []string
+	if strings.ContainsAny(basePattern, "*?[") {
+		expanded, err := filepath.Glob(basePattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base pattern %q: %w", basePattern, err)
+		}
+		for _, b := range expanded {
+			info, statErr := os.Stat(b)
+			if statErr == nil && info.IsDir() {
+				bases = append(bases, b)
+			}
+		}
+	} else {
+		bases = []string{filepath.Clean(basePattern)}
+	}
+
+	var matches []string
+	for _, base := range bases {
+		err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+
+			if tail == "" {
+				matches = append(matches, path)
+				return nil
+			}
+
+			rel, relErr := filepath.Rel(base, path)
+			if relErr != nil {
+				return nil
+			}
+
+			// Try matching tail against every suffix of the relative path so that
+			// patterns like **/deep/nested/*.yaml match a/b/deep/nested/f.yaml.
+			segments := strings.Split(rel, string(filepath.Separator))
+			for i := range segments {
+				suffix := filepath.Join(segments[i:]...)
+				if matched, _ := filepath.Match(tail, suffix); matched {
+					matches = append(matches, path)
+					return nil
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return matches, nil
 }
 
 func configuredSafeDirectories() []string {

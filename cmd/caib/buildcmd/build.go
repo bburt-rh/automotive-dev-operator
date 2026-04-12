@@ -447,6 +447,13 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	localRefs, refsErr := common.FindLocalFileReferences(string(manifestBytes), filepath.Dir(manifestPath))
+	if refsErr != nil {
+		h.handleError(fmt.Errorf("manifest file reference error: %w", refsErr))
+		return
+	}
+	req.HasLocalFiles = len(localRefs) > 0
+
 	resp, err := api.CreateBuild(ctx, req)
 	if err != nil {
 		h.handleError(err)
@@ -455,11 +462,6 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 	fmt.Printf("Build %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
 	h.displayBuildLogsCommand(resp.Name)
 
-	localRefs, refsErr := common.FindLocalFileReferences(string(manifestBytes))
-	if refsErr != nil {
-		h.handleError(fmt.Errorf("manifest file reference error: %w", refsErr))
-		return
-	}
 	if len(localRefs) > 0 {
 		if err := h.handleFileUploads(ctx, api, resp.Name, localRefs); err != nil {
 			h.handleError(err)
@@ -680,6 +682,13 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	localRefs, refsErr := common.FindLocalFileReferences(string(manifestBytes), filepath.Dir(manifestPath))
+	if refsErr != nil {
+		h.handleError(fmt.Errorf("manifest file reference error: %w", refsErr))
+		return
+	}
+	req.HasLocalFiles = len(localRefs) > 0
+
 	resp, err := api.CreateBuild(ctx, req)
 	if err != nil {
 		h.handleError(err)
@@ -688,11 +697,6 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 	fmt.Printf("Build %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
 	h.displayBuildLogsCommand(resp.Name)
 
-	localRefs, refsErr := common.FindLocalFileReferences(string(manifestBytes))
-	if refsErr != nil {
-		h.handleError(fmt.Errorf("manifest file reference error: %w", refsErr))
-		return
-	}
 	if len(localRefs) > 0 {
 		if err := h.handleFileUploads(ctx, api, resp.Name, localRefs); err != nil {
 			h.handleError(err)
