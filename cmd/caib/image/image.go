@@ -116,7 +116,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	buildCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "name for the ImageBuild (auto-generated if omitted)")
 	buildCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution to build")
-	buildCmd.Flags().StringVarP(opts.Target, "target", "t", "qemu", "target platform")
+	buildCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: from manifest, or qemu)")
 	buildCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	buildCmd.Flags().StringVar(opts.ContainerPush, "push", "", "push bootc container to registry (optional if --disk is used)")
 	buildCmd.Flags().BoolVar(opts.BuildDiskImage, "disk", false, "also build disk image from container")
@@ -191,7 +191,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 		"path to Docker/Podman auth file for push authentication (takes precedence over env vars and auto-discovery)",
 	)
 	diskCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution")
-	diskCmd.Flags().StringVarP(opts.Target, "target", "t", "qemu", "target platform")
+	diskCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: qemu)")
 	diskCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	diskCmd.Flags().StringVar(
 		opts.AutomotiveImageBuilder, "aib-image",
@@ -219,7 +219,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildDevCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	buildDevCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "name for the ImageBuild")
 	buildDevCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution to build")
-	buildDevCmd.Flags().StringVarP(opts.Target, "target", "t", "qemu", "target platform")
+	buildDevCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: from manifest, or qemu)")
 	buildDevCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	buildDevCmd.Flags().StringVar(opts.Mode, "mode", "package", "build mode: image (ostree) or package (package-based)")
 	buildDevCmd.Flags().StringVar(opts.ExportFormat, "format", "", "export format: qcow2, raw, simg, etc.")

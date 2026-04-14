@@ -11,6 +11,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// ManifestTarget extracts the top-level "target" field from a manifest YAML.
+// Returns empty string if the field is absent, blank, or the YAML is invalid.
+func ManifestTarget(manifest []byte) string {
+	var m struct {
+		Target string `yaml:"target"`
+	}
+	if err := yaml.Unmarshal(manifest, &m); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(m.Target)
+}
+
 // FindLocalFileReferences extracts manifest add_files source_path and
 // source_glob references. Glob patterns are expanded locally and each
 // matched file is returned as a separate source_path entry.

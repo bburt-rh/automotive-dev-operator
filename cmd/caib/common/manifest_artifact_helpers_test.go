@@ -6,6 +6,58 @@ import (
 	"testing"
 )
 
+func TestManifestTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{
+			name:     "target present",
+			manifest: "name: my-image\ntarget: j784s4evm\n",
+			want:     "j784s4evm",
+		},
+		{
+			name:     "target absent",
+			manifest: "name: my-image\n",
+			want:     "",
+		},
+		{
+			name:     "empty manifest",
+			manifest: "",
+			want:     "",
+		},
+		{
+			name:     "invalid yaml",
+			manifest: ": : :\n",
+			want:     "",
+		},
+		{
+			name:     "target is empty string",
+			manifest: "name: my-image\ntarget: \"\"\n",
+			want:     "",
+		},
+		{
+			name:     "target is whitespace only",
+			manifest: "name: my-image\ntarget: \"  \"\n",
+			want:     "",
+		},
+		{
+			name:     "target with surrounding whitespace",
+			manifest: "name: my-image\ntarget: \" qemu \"\n",
+			want:     "qemu",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ManifestTarget([]byte(tt.manifest))
+			if got != tt.want {
+				t.Errorf("ManifestTarget() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFindLocalFileReferences_SourcePath(t *testing.T) {
 	manifest := `
 content:
