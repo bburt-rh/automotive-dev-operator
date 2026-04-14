@@ -174,6 +174,21 @@ func (h *Handler) applyRegistryCredentialsToRequest(req *buildapitypes.BuildRequ
 	return nil
 }
 
+// resolveTarget determines the build target: --target flag > manifest value > "qemu".
+func (h *Handler) resolveTarget(cmd *cobra.Command, manifestTarget string) {
+	if cmd.Flags().Changed("target") {
+		return
+	}
+
+	if manifestTarget != "" {
+		*h.opts.Target = manifestTarget
+		fmt.Printf("Using target %q from manifest\n", manifestTarget)
+		return
+	}
+
+	*h.opts.Target = "qemu"
+}
+
 // fetchTargetDefaults fetches the operator config once and returns it.
 // If flash is enabled, it also validates that the target has a Jumpstarter mapping.
 func (h *Handler) fetchTargetDefaults(
@@ -406,6 +421,8 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	h.resolveTarget(cmd, common.ManifestTarget(manifestBytes))
+
 	req := buildapitypes.BuildRequest{
 		Name:                   *h.opts.BuildName,
 		Manifest:               string(manifestBytes),
@@ -523,6 +540,8 @@ func (h *Handler) RunDisk(cmd *cobra.Command, args []string) {
 		return
 	}
 
+	h.resolveTarget(cmd, "") // no manifest for disk command
+
 	req := buildapitypes.BuildRequest{
 		Name:                   *h.opts.BuildName,
 		ContainerRef:           containerRef,
@@ -628,6 +647,8 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 		h.handleError(fmt.Errorf("error reading manifest: %w", err))
 		return
 	}
+
+	h.resolveTarget(cmd, common.ManifestTarget(manifestBytes))
 
 	var parsedMode buildapitypes.Mode
 	switch *h.opts.Mode {
