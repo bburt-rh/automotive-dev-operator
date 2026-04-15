@@ -692,21 +692,21 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	// Add flash params if flash is enabled
 	var flashExporterSelector, flashCmd, flashOCIAuthSecretName string
 	if imageBuild.Spec.IsFlashEnabled() {
-		// User-specified exporter selector bypasses target lookup entirely
 		flashExporterSelector = imageBuild.Spec.GetFlashExporterSelector()
-		if flashExporterSelector == "" {
-			target := imageBuild.Spec.GetTarget()
-			if operatorConfig.Spec.Jumpstarter != nil {
-				if mapping, ok := operatorConfig.Spec.Jumpstarter.TargetMappings[target]; ok {
+		target := imageBuild.Spec.GetTarget()
+		// Look up target mapping for selector (if not overridden) and flash command
+		if operatorConfig.Spec.Jumpstarter != nil {
+			if mapping, ok := operatorConfig.Spec.Jumpstarter.TargetMappings[target]; ok {
+				if flashExporterSelector == "" {
 					flashExporterSelector = mapping.Selector
-					flashCmd = mapping.FlashCmd
 				}
+				flashCmd = mapping.FlashCmd
 			}
-			if flashExporterSelector == "" {
-				return fmt.Errorf("flash enabled but no Jumpstarter target mapping found for target %q; "+
-					"configure OperatorConfig.spec.jumpstarter.targetMappings[%q] with selector and flashCmd, "+
-					"or set flash.exporterSelector directly", target, target)
-			}
+		}
+		if flashExporterSelector == "" {
+			return fmt.Errorf("flash enabled but no Jumpstarter target mapping found for target %q; "+
+				"configure OperatorConfig.spec.jumpstarter.targetMappings[%q] with selector and flashCmd, "+
+				"or set flash.exporterSelector directly", target, target)
 		}
 		// User-specified flash command overrides OperatorConfig
 		if userCmd := imageBuild.Spec.GetFlashCmd(); userCmd != "" {

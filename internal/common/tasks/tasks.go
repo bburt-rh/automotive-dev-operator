@@ -844,7 +844,7 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 				{
 					Name:        "flash-cmd",
 					Type:        tektonv1.ParamTypeString,
-					Description: "Custom flash command (default: j storage flash ${IMAGE_REF})",
+					Description: "Custom flash command (default: j storage flash oci://{image_uri})",
 					Default: &tektonv1.ParamValue{
 						Type:      tektonv1.ParamTypeString,
 						StringVal: "",
@@ -1546,7 +1546,7 @@ func GenerateFlashTask(namespace string, buildConfig *BuildConfig) *tektonv1.Tas
 				{
 					Name:        "flash-cmd",
 					Type:        tektonv1.ParamTypeString,
-					Description: "Command to run for flashing (default: j storage flash ${IMAGE_REF})",
+					Description: "Command to run for flashing (default: j storage flash oci://{image_uri})",
 					Default: &tektonv1.ParamValue{
 						Type:      tektonv1.ParamTypeString,
 						StringVal: "",
