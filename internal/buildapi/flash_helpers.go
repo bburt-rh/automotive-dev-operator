@@ -25,9 +25,11 @@ type httpError struct {
 func resolveFlashTargetConfig(req FlashRequest, operatorConfig *automotivev1alpha1.OperatorConfig) (string, string) {
 	exporterSelector := req.ExporterSelector
 	flashCmd := req.FlashCmd
-	if req.Target != "" && exporterSelector == "" && operatorConfig.Spec.Jumpstarter != nil {
+	if req.Target != "" && operatorConfig.Spec.Jumpstarter != nil {
 		if mapping, ok := operatorConfig.Spec.Jumpstarter.TargetMappings[req.Target]; ok {
-			exporterSelector = mapping.Selector
+			if exporterSelector == "" {
+				exporterSelector = mapping.Selector
+			}
 			if flashCmd == "" {
 				flashCmd = mapping.FlashCmd
 			}
