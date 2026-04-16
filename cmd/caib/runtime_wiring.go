@@ -259,6 +259,7 @@ func (s runtimeState) imageOptions(h handlerSet) image.Options {
 		RunInjectSigned:      h.sealed.RunInjectSigned,
 		RunToken:             h.token.RunToken,
 		RunDelete:            h.build.RunDelete,
+		RunCancel:            h.build.RunCancel,
 		GetDefaultArch:       getDefaultArch,
 
 		ServerURL:              s.ServerURL,

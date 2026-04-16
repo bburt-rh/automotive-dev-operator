@@ -148,6 +148,11 @@ func (h *Handler) waitForBuildCompletion(ctx context.Context, api *buildapiclien
 				}
 				return nil
 			}
+			if st.Phase == phaseCancelled {
+				pb.Clear()
+				fmt.Println("Build was cancelled.")
+				return fmt.Errorf("build cancelled")
+			}
 			if st.Phase == phaseFailed {
 				pb.Clear()
 				isFlashFailure := strings.Contains(strings.ToLower(st.Message), errPrefixFlash) ||
@@ -273,7 +278,7 @@ func (h *Handler) RunLogs(_ *cobra.Command, args []string) {
 	}
 	fmt.Printf("Build %s: %s - %s\n", name, st.Phase, st.Message)
 
-	if st.Phase == phaseCompleted || st.Phase == phaseFailed {
+	if isTerminalPhase(st.Phase) {
 		logTransport := &http.Transport{
 			ResponseHeaderTimeout: 30 * time.Second,
 		}
