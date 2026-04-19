@@ -29,6 +29,62 @@ type BuildConfig struct {
 	TrustedCABundleKind         string
 	TrustedCABundleName         string
 	UsePVCScratchVolumes        bool
+	TaskResolver                string // TaskResolverCluster (default) or TaskResolverBundle
+	TaskBundleRef               string // OCI bundle ref when TaskResolver is TaskResolverBundle
+}
+
+const (
+	// TaskResolverCluster resolves tasks from the cluster-installed resources.
+	TaskResolverCluster = "cluster"
+	// TaskResolverBundle resolves tasks from a signed Tekton Bundle OCI image.
+	TaskResolverBundle = "bundle"
+	// tektonResolverBundles is the Tekton-internal resolver name for bundles (plural).
+	tektonResolverBundles = "bundles"
+)
+
+// buildTaskRef constructs a TaskRef that uses either the cluster resolver or the
+// bundles resolver, depending on BuildConfig.TaskResolver.
+func buildTaskRef(taskName, namespace string, buildConfig *BuildConfig) *tektonv1.TaskRef {
+	if buildConfig != nil && buildConfig.TaskResolver == TaskResolverBundle && buildConfig.TaskBundleRef != "" {
+		return &tektonv1.TaskRef{
+			ResolverRef: tektonv1.ResolverRef{
+				Resolver: tektonResolverBundles,
+				Params: []tektonv1.Param{
+					{
+						Name:  "bundle",
+						Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: buildConfig.TaskBundleRef},
+					},
+					{
+						Name:  "name",
+						Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskName},
+					},
+					{
+						Name:  "kind",
+						Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "task"},
+					},
+				},
+			},
+		}
+	}
+	return &tektonv1.TaskRef{
+		ResolverRef: tektonv1.ResolverRef{
+			Resolver: TaskResolverCluster,
+			Params: []tektonv1.Param{
+				{
+					Name:  "kind",
+					Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "task"},
+				},
+				{
+					Name:  "name",
+					Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: taskName},
+				},
+				{
+					Name:  "namespace",
+					Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: namespace},
+				},
+			},
+		},
+	}
 }
 
 // getAutomotiveImageBuilderImage returns the AIB image from config or the default constant
@@ -84,11 +140,13 @@ const workspaceNameShared = "shared-workspace"
 // Tekton resolves this at runtime to the actual volume name in the pod spec.
 const workspaceVolumeRef = "$(workspaces." + workspaceNameShared + ".volume)"
 
-const defaultTrustedCABundleConfigMap = "rhivos-ca-bundle"
+// DefaultTrustedCABundleConfigMap is the default ConfigMap name for trusted CA bundles.
+// Exported so the controller can detect divergence when using bundle-resolved tasks.
+const DefaultTrustedCABundleConfigMap = "rhivos-ca-bundle"
 
 func trustedCABundleVolumeSource(buildConfig *BuildConfig) corev1.VolumeSource {
 	kind := "ConfigMap"
-	name := defaultTrustedCABundleConfigMap
+	name := DefaultTrustedCABundleConfigMap
 	optional := true
 	if buildConfig != nil {
 		// Explicit trusted CA configuration should fail fast when missing.
@@ -210,6 +268,43 @@ func GeneratePushArtifactRegistryTask(namespace string, buildConfig *BuildConfig
 						StringVal: "",
 					},
 				},
+				{
+					Name:        "expected-artifact-digest",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Expected SHA-256 digest of the artifact(s) from the build task, for integrity verification",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: "",
+					},
+				},
+				{
+					Name:        "secure-build",
+					Type:        tektonv1.ParamTypeString,
+					Description: "When true, attestation failures (e.g. oras attach) are fatal instead of best-effort",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: "false",
+					},
+				},
+				{
+					Name:        "yq-helper-image",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Container image for yq helper steps",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getYQHelperImage(),
+					},
+				},
+			},
+			Results: []tektonv1.TaskResult{
+				{
+					Name:        "IMAGE_URL",
+					Description: "Pushed disk artifact OCI URL (Tekton Chains type hint)",
+				},
+				{
+					Name:        "IMAGE_DIGEST",
+					Description: "Pushed disk artifact OCI digest (Tekton Chains type hint)",
+				},
 			},
 			Workspaces: []tektonv1.WorkspaceDeclaration{
 				{
@@ -221,7 +316,7 @@ func GeneratePushArtifactRegistryTask(namespace string, buildConfig *BuildConfig
 			Steps: []tektonv1.Step{
 				{
 					Name:  "push-artifact",
-					Image: buildConfig.getYQHelperImage(),
+					Image: "$(params.yq-helper-image)",
 					Env: []corev1.EnvVar{
 						{
 							Name:  "DOCKER_CONFIG",
@@ -410,6 +505,15 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 						StringVal: "false",
 					},
 				},
+				{
+					Name:        "yq-helper-image",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Container image for yq helper steps",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getYQHelperImage(),
+					},
+				},
 			},
 			Results: []tektonv1.TaskResult{
 				{
@@ -440,6 +544,18 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 					Name:        "build-timing",
 					Description: "JSON timing breakdown of build phases in seconds",
 				},
+				{
+					Name:        "IMAGE_URL",
+					Description: "Pushed bootc container image URL (Tekton Chains type hint)",
+				},
+				{
+					Name:        "IMAGE_DIGEST",
+					Description: "Pushed bootc container image digest (Tekton Chains type hint)",
+				},
+				{
+					Name:        "ARTIFACT_INTEGRITY_DIGEST",
+					Description: "SHA-256 digest of disk artifact(s) for cross-task integrity verification",
+				},
 			},
 			Workspaces: []tektonv1.WorkspaceDeclaration{
 				{
@@ -462,7 +578,7 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 			Steps: []tektonv1.Step{
 				{
 					Name:   "find-manifest-file",
-					Image:  buildConfig.getYQHelperImage(),
+					Image:  "$(params.yq-helper-image)",
 					Script: FindManifestScript,
 					VolumeMounts: []corev1.VolumeMount{
 						{
@@ -742,6 +858,15 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					Description: "automotive-image-builder container image to use for building",
 				},
 				{
+					Name: "yq-helper-image",
+					Type: tektonv1.ParamTypeString,
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getYQHelperImage(),
+					},
+					Description: "Container image for yq helper steps",
+				},
+				{
 					Name:        "secret-ref",
 					Type:        tektonv1.ParamTypeString,
 					Description: "Secret reference for registry credentials",
@@ -886,6 +1011,15 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 						StringVal: "false",
 					},
 				},
+				{
+					Name:        "secure-build",
+					Type:        tektonv1.ParamTypeString,
+					Description: "When true, attestation failures are fatal (true/false)",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: "false",
+					},
+				},
 			},
 			Workspaces: []tektonv1.PipelineWorkspaceDeclaration{
 				{Name: workspaceNameShared},
@@ -915,38 +1049,36 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					Description: "JSON timing breakdown of build phases in seconds",
 					Value:       tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "$(tasks.build-image.results.build-timing)"},
 				},
+				{
+					Name:        "container-image-url",
+					Description: "Pushed bootc container image URL",
+					Value:       tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "$(tasks.build-image.results.IMAGE_URL)"},
+				},
+				{
+					Name:        "container-image-digest",
+					Description: "Pushed bootc container image digest",
+					Value:       tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "$(tasks.build-image.results.IMAGE_DIGEST)"},
+				},
+				{
+					Name:        "disk-artifact-url",
+					Description: "Pushed disk artifact OCI URL",
+					Value:       tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "$(tasks.push-disk-artifact.results.IMAGE_URL)"},
+				},
+				{
+					Name:        "disk-artifact-digest",
+					Description: "Pushed disk artifact OCI digest",
+					Value:       tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "$(tasks.push-disk-artifact.results.IMAGE_DIGEST)"},
+				},
+				{
+					Name:        "IMAGES",
+					Description: "Newline-separated image@digest list for Tekton Chains attestation",
+					Value:       tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "$(finally.collect-images-result.results.IMAGES)"},
+				},
 			},
 			Tasks: []tektonv1.PipelineTask{
 				{
-					Name: "build-image",
-					TaskRef: &tektonv1.TaskRef{
-						ResolverRef: tektonv1.ResolverRef{
-							Resolver: "cluster",
-							Params: []tektonv1.Param{
-								{
-									Name: "kind",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: "task",
-									},
-								},
-								{
-									Name: "name",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: "build-automotive-image",
-									},
-								},
-								{
-									Name: "namespace",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: namespace,
-									},
-								},
-							},
-						},
-					},
+					Name:    "build-image",
+					TaskRef: buildTaskRef("build-automotive-image", namespace, buildConfig),
 					Params: []tektonv1.Param{
 						{
 							Name: "target-architecture",
@@ -1056,6 +1188,13 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 								StringVal: "$(params.use-persistent-cache)",
 							},
 						},
+						{
+							Name: "yq-helper-image",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(params.yq-helper-image)",
+							},
+						},
 					},
 					Workspaces: []tektonv1.WorkspacePipelineTaskBinding{
 						{Name: workspaceNameShared, Workspace: workspaceNameShared},
@@ -1065,35 +1204,8 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					Timeout: &metav1.Duration{Duration: time.Duration(buildConfig.getBuildTimeoutMinutes()) * time.Minute},
 				},
 				{
-					Name: "push-disk-artifact",
-					TaskRef: &tektonv1.TaskRef{
-						ResolverRef: tektonv1.ResolverRef{
-							Resolver: "cluster",
-							Params: []tektonv1.Param{
-								{
-									Name: "kind",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: "task",
-									},
-								},
-								{
-									Name: "name",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: "push-artifact-registry",
-									},
-								},
-								{
-									Name: "namespace",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: namespace,
-									},
-								},
-							},
-						},
-					},
+					Name:    "push-disk-artifact",
+					TaskRef: buildTaskRef("push-artifact-registry", namespace, buildConfig),
 					Params: []tektonv1.Param{
 						{
 							Name: "distro",
@@ -1172,6 +1284,27 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 								StringVal: "$(tasks.build-image.results.aib-command)",
 							},
 						},
+						{
+							Name: "expected-artifact-digest",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(tasks.build-image.results.ARTIFACT_INTEGRITY_DIGEST)",
+							},
+						},
+						{
+							Name: "secure-build",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(params.secure-build)",
+							},
+						},
+						{
+							Name: "yq-helper-image",
+							Value: tektonv1.ParamValue{
+								Type:      tektonv1.ParamTypeString,
+								StringVal: "$(params.yq-helper-image)",
+							},
+						},
 					},
 					Workspaces: []tektonv1.WorkspacePipelineTaskBinding{
 						{Name: workspaceNameShared, Workspace: workspaceNameShared},
@@ -1191,35 +1324,8 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					},
 				},
 				{
-					Name: "flash-image",
-					TaskRef: &tektonv1.TaskRef{
-						ResolverRef: tektonv1.ResolverRef{
-							Resolver: "cluster",
-							Params: []tektonv1.Param{
-								{
-									Name: "kind",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: "task",
-									},
-								},
-								{
-									Name: "name",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: "flash-image",
-									},
-								},
-								{
-									Name: "namespace",
-									Value: tektonv1.ParamValue{
-										Type:      tektonv1.ParamTypeString,
-										StringVal: namespace,
-									},
-								},
-							},
-						},
-					},
+					Name:    "flash-image",
+					TaskRef: buildTaskRef("flash-image", namespace, buildConfig),
 					Params: []tektonv1.Param{
 						{
 							Name: "image-ref",
@@ -1283,6 +1389,58 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 						},
 					},
 					Timeout: &metav1.Duration{Duration: time.Duration(buildConfig.getFlashTimeoutMinutes()) * time.Minute},
+				},
+			},
+			Finally: []tektonv1.PipelineTask{
+				{
+					Name: "collect-images-result",
+					TaskSpec: &tektonv1.EmbeddedTask{
+						TaskSpec: tektonv1.TaskSpec{
+							Workspaces: []tektonv1.WorkspaceDeclaration{
+								{Name: workspaceNameShared, MountPath: "/workspace/shared"},
+							},
+							Results: []tektonv1.TaskResult{
+								{
+									Name:        "IMAGES",
+									Description: "Newline-separated image@digest list for Tekton Chains attestation",
+								},
+							},
+							Steps: []tektonv1.Step{
+								{
+									Name:  "collect",
+									Image: buildConfig.getYQHelperImage(),
+									Script: `#!/bin/sh
+# Read results from workspace files written by build/push tasks.
+# This avoids referencing results from potentially-skipped tasks.
+CHAINS_DIR="/workspace/shared/.chains"
+IMAGES=""
+if [ -f "$CHAINS_DIR/container/url" ] && [ -f "$CHAINS_DIR/container/digest" ]; then
+  url=$(cat "$CHAINS_DIR/container/url")
+  digest=$(cat "$CHAINS_DIR/container/digest")
+  if [ -n "$url" ] && [ -n "$digest" ]; then
+    IMAGES="${url}@${digest}"
+  fi
+fi
+if [ -f "$CHAINS_DIR/disk/url" ] && [ -f "$CHAINS_DIR/disk/digest" ]; then
+  url=$(cat "$CHAINS_DIR/disk/url")
+  digest=$(cat "$CHAINS_DIR/disk/digest")
+  if [ -n "$url" ] && [ -n "$digest" ]; then
+    if [ -n "$IMAGES" ]; then
+      IMAGES="${IMAGES}
+"
+    fi
+    IMAGES="${IMAGES}${url}@${digest}"
+  fi
+fi
+printf '%s' "$IMAGES" > "$(results.IMAGES.path)"
+`,
+								},
+							},
+						},
+					},
+					Workspaces: []tektonv1.WorkspacePipelineTaskBinding{
+						{Name: workspaceNameShared, Workspace: workspaceNameShared},
+					},
 				},
 			},
 		},

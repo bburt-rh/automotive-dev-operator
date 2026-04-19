@@ -14,6 +14,16 @@ umask 0077
 
 setup_cluster_auth
 
+# Initialize Tekton results with empty defaults.
+# Tekton requires all declared results to exist; these are overwritten
+# later when applicable.
+echo -n "" > /tekton/results/IMAGE_URL
+echo -n "" > /tekton/results/IMAGE_DIGEST
+echo -n "" > /tekton/results/ARTIFACT_INTEGRITY_DIGEST
+
+# Clear stale Chains result files from previous builds on reused workspace PVCs.
+rm -rf "$WORKSPACE_PATH/.chains"
+
 # Read registry credentials from workspace and set up auth
 read_registry_creds "/workspace/registry-auth"
 setup_registry_auth || echo "No custom registry auth found, using cluster auth only"
@@ -462,12 +472,14 @@ PYEOF
           echo "⏱ Container annotate: $((ANNOTATE_DONE - COPY_DONE))s"
 
           echo "Pushing container to registry: $CONTAINER_PUSH"
-          skopeo copy --authfile="$REGISTRY_AUTH_FILE" "oci:${OCI_DIR}:latest" "docker://$CONTAINER_PUSH"
+          skopeo copy --digestfile /tmp/container-push-digest.txt \
+            --authfile="$REGISTRY_AUTH_FILE" "oci:${OCI_DIR}:latest" "docker://$CONTAINER_PUSH"
           rm -rf "${OCI_DIR:-/tmp/nonexistent}" 2>/dev/null || true
           PUSH_DONE=$(date +%s)
           echo "⏱ Container registry push: $((PUSH_DONE - ANNOTATE_DONE))s"
           echo "⏱ Container push total: $((PUSH_DONE - PUSH_START))s"
           echo "Container pushed successfully to $CONTAINER_PUSH"
+          echo "Container digest: $(cat /tmp/container-push-digest.txt 2>/dev/null)"
         ) &
         CONTAINER_PUSH_PID=$!
       fi
@@ -740,10 +752,54 @@ else
   echo "Warning: final_name is empty, no artifact filename will be recorded"
 fi
 
+# Compute artifact integrity digest for cross-task verification.
+# Covers both multi-layer (parts directory) and single-file modes.
+if [ -n "$final_name" ] && [ "$final_name" != "container:$CONTAINER_PUSH" ]; then
+  parts_dir="$WORKSPACE_PATH/${final_name}-parts"
+
+  # For ride4/ridesx4 targets, duplicate boot_a as boot_b BEFORE computing the
+  # integrity digest so the digest covers the complete artifact that will be pushed.
+  if [ -d "$parts_dir" ]; then
+    case "$(params.target)" in
+      ride4*|ridesx4*)
+        for boot_a_file in "${parts_dir}"/boot_a.*; do
+          [ -f "$boot_a_file" ] || continue
+          boot_b_file=$(echo "$boot_a_file" | sed 's/boot_a/boot_b/')
+          if [ ! -f "$boot_b_file" ]; then
+            echo "Duplicating $(basename "$boot_a_file") as $(basename "$boot_b_file") for target $(params.target)"
+            cp "$boot_a_file" "$boot_b_file"
+          fi
+        done
+        ;;
+    esac
+  fi
+
+  ARTIFACT_DIGEST=$(compute_artifact_digest "$parts_dir" "$WORKSPACE_PATH/$final_name")
+  if [ -n "$ARTIFACT_DIGEST" ]; then
+    echo "Artifact integrity digest: $ARTIFACT_DIGEST"
+    echo -n "$ARTIFACT_DIGEST" > /tekton/results/ARTIFACT_INTEGRITY_DIGEST
+  fi
+fi
+
 # Wait for background container push to complete (bootc mode only)
 if [ -n "${CONTAINER_PUSH_PID:-}" ]; then
   echo "Waiting for container push to complete..."
   wait "$CONTAINER_PUSH_PID" || { echo "Error: Container push failed"; exit 1; }
+fi
+
+# Write Tekton Chains type hint results for bootc container
+if [ -n "${CONTAINER_PUSH:-}" ]; then
+  PUSHED_DIGEST=$(cat /tmp/container-push-digest.txt 2>/dev/null || echo "")
+  if [ -z "$PUSHED_DIGEST" ]; then
+    echo "WARNING: container push completed but no digest was captured, skipping Chains hints"
+  fi
+  echo -n "$CONTAINER_PUSH" > /tekton/results/IMAGE_URL
+  echo -n "$PUSHED_DIGEST" > /tekton/results/IMAGE_DIGEST
+  echo "Tekton Chains: IMAGE_URL=$CONTAINER_PUSH IMAGE_DIGEST=$PUSHED_DIGEST"
+  # Write to workspace for cross-task access (avoids Tekton result-ref issues with skipped tasks)
+  mkdir -p "$WORKSPACE_PATH/.chains/container"
+  echo -n "$CONTAINER_PUSH" > "$WORKSPACE_PATH/.chains/container/url"
+  echo -n "$PUSHED_DIGEST" > "$WORKSPACE_PATH/.chains/container/digest"
 fi
 
 BUILD_END_TIME=$(date +%s)

@@ -70,6 +70,8 @@ type Options struct {
 	InternalRegistryImageName *string
 	InternalRegistryTag       *string
 
+	SecureBuild *bool
+
 	InsecureSkipTLS *bool
 
 	HandleError func(error)
@@ -444,6 +446,7 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 		ExportOCI:              *h.opts.ExportOCI,
 		BuilderImage:           *h.opts.BuilderImage,
 		RebuildBuilder:         *h.opts.RebuildBuilder,
+		SecureBuild:            *h.opts.SecureBuild,
 	}
 
 	if err := h.applyRegistryCredentialsToRequest(&req); err != nil {
@@ -555,6 +558,7 @@ func (h *Handler) RunDisk(cmd *cobra.Command, args []string) {
 		AIBExtraArgs:           *h.opts.AIBExtraArgs,
 		Compression:            *h.opts.CompressionAlgo,
 		ExportOCI:              *h.opts.ExportOCI,
+		SecureBuild:            *h.opts.SecureBuild,
 	}
 
 	if err := h.applyRegistryCredentialsToRequest(&req); err != nil {
@@ -683,6 +687,7 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 		Workspace:              *h.opts.Workspace,
 		Compression:            *h.opts.CompressionAlgo,
 		ExportOCI:              *h.opts.ExportOCI,
+		SecureBuild:            *h.opts.SecureBuild,
 	}
 
 	if err := h.applyRegistryCredentialsToRequest(&req); err != nil {
