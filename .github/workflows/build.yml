@@ -16,7 +16,7 @@ env:
     OPERATOR_IMAGE: ${{ vars.REGISTRY }}/${{ vars.REPOSITORY }}/automotive-dev-operator
     TOOLCHAIN_IMAGE: ${{ vars.REGISTRY }}/${{ vars.REPOSITORY }}/autosd-toolchain
     AIB_BASE_IMAGE: ${{ vars.REGISTRY }}/${{ vars.REPOSITORY }}/aib-base-dev
-    TEKTON_BUNDLE_IMAGE: ${{ vars.REGISTRY }}/${{ vars.REPOSITORY }}/automotive-dev-tekton-tasks
+    TEKTON_BUNDLE_IMAGE: ${{ vars.REGISTRY }}/${{ vars.REPOSITORY }}/automotive-dev-operator-tekton-tasks
     VERSION: ${{ github.sha }}
     AIB_CLI_BINARY: "caib"
 
