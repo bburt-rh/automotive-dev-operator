@@ -37,7 +37,7 @@ jobs:
                   password: ${{ secrets.REGISTRY_PASSWORD }}
 
             - name: Build and push operator (ARM64)
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: Dockerfile
@@ -50,7 +50,7 @@ jobs:
                   cache-to: type=gha,mode=max
 
             - name: Build and push toolchain (ARM64)
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: Containerfile.toolchain
@@ -79,7 +79,7 @@ jobs:
                   password: ${{ secrets.REGISTRY_PASSWORD }}
 
             - name: Build and push operator (AMD64)
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: Dockerfile
@@ -92,7 +92,7 @@ jobs:
                   cache-to: type=gha,mode=max
 
             - name: Build and push toolchain (AMD64)
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: Containerfile.toolchain
@@ -254,7 +254,7 @@ jobs:
                     BUNDLE_IMG="${{ env.BUNDLE_IMAGE }}:${TAG_NAME}"
 
             - name: Build and push multi-arch catalog image
-              uses: docker/build-push-action@v6
+              uses: docker/build-push-action@v7
               with:
                   context: .
                   file: catalog.Dockerfile
