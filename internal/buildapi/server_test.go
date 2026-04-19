@@ -9,7 +9,9 @@ import (
 	"os"
 	"time"
 
+	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -88,6 +90,7 @@ var _ = Describe("APIServer", func() {
 			{"GET", "/v1/builds/test-build/logs"},
 			{"GET", "/v1/builds/test-build/template"},
 			{"POST", "/v1/builds/test-build/uploads"},
+			{"POST", "/v1/builds/test-build/cancel"},
 			{"DELETE", "/v1/builds/test-build"},
 		}
 
@@ -290,6 +293,220 @@ var _ = Describe("APIServer", func() {
 				Name: "my-ir-build", Namespace: "test-ns",
 			}, isCheck)
 			Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Context("Cancel Build", func() {
+		var (
+			originalGetClientFromRequestFn func(*gin.Context) (ctrlclient.Client, error)
+			originalNamespace              string
+			hasOriginalNamespace           bool
+		)
+
+		BeforeEach(func() {
+			originalGetClientFromRequestFn = getClientFromRequestFn
+			originalNamespace, hasOriginalNamespace = os.LookupEnv("BUILD_API_NAMESPACE")
+			Expect(os.Setenv("BUILD_API_NAMESPACE", "test-ns")).To(Succeed())
+		})
+
+		AfterEach(func() {
+			getClientFromRequestFn = originalGetClientFromRequestFn
+			if hasOriginalNamespace {
+				Expect(os.Setenv("BUILD_API_NAMESPACE", originalNamespace)).To(Succeed())
+			} else {
+				Expect(os.Unsetenv("BUILD_API_NAMESPACE")).To(Succeed())
+			}
+		})
+
+		newCancelTestBuild := func(phase, pipelineRunName string) *automotivev1alpha1.ImageBuild {
+			build := &automotivev1alpha1.ImageBuild{}
+			build.Name = "my-build"
+			build.Namespace = testNamespace
+			build.Annotations = map[string]string{
+				"automotive.sdv.cloud.redhat.com/requested-by": "alice",
+			}
+			build.Status.Phase = phase
+			build.Status.PipelineRunName = pipelineRunName
+			return build
+		}
+
+		newCancelFakeClient := func(objs ...ctrlclient.Object) ctrlclient.Client {
+			scheme := runtime.NewScheme()
+			Expect(automotivev1alpha1.AddToScheme(scheme)).To(Succeed())
+			Expect(tektonv1.AddToScheme(scheme)).To(Succeed())
+			return fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				WithStatusSubresource(&automotivev1alpha1.ImageBuild{}).
+				Build()
+		}
+
+		It("should return 404 when build does not exist", func() {
+			fakeClient := newCancelFakeClient()
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/nonexistent/cancel", nil)
+			c.Set("requester", "alice")
+
+			server.cancelBuild(c, "nonexistent")
+
+			Expect(w.Code).To(Equal(http.StatusNotFound))
+			Expect(w.Body.String()).To(ContainSubstring("build not found"))
+		})
+
+		It("should return 403 when user does not own the build", func() {
+			build := newCancelTestBuild("Building", "")
+			fakeClient := newCancelFakeClient(build)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/my-build/cancel", nil)
+			c.Set("requester", "bob")
+
+			server.cancelBuild(c, "my-build")
+
+			Expect(w.Code).To(Equal(http.StatusForbidden))
+			Expect(w.Body.String()).To(ContainSubstring("you can only cancel your own builds"))
+		})
+
+		It("should return 409 when build is already completed", func() {
+			build := newCancelTestBuild("Completed", "")
+			fakeClient := newCancelFakeClient(build)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/my-build/cancel", nil)
+			c.Set("requester", "alice")
+
+			server.cancelBuild(c, "my-build")
+
+			Expect(w.Code).To(Equal(http.StatusConflict))
+			Expect(w.Body.String()).To(ContainSubstring("cannot be cancelled"))
+		})
+
+		It("should return 409 when build has already failed", func() {
+			build := newCancelTestBuild("Failed", "")
+			fakeClient := newCancelFakeClient(build)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/my-build/cancel", nil)
+			c.Set("requester", "alice")
+
+			server.cancelBuild(c, "my-build")
+
+			Expect(w.Code).To(Equal(http.StatusConflict))
+			Expect(w.Body.String()).To(ContainSubstring("cannot be cancelled"))
+		})
+
+		It("should cancel a pending build without a PipelineRun", func() {
+			build := newCancelTestBuild("Pending", "")
+			fakeClient := newCancelFakeClient(build)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/my-build/cancel", nil)
+			c.Set("requester", "alice")
+
+			server.cancelBuild(c, "my-build")
+
+			Expect(w.Code).To(Equal(http.StatusOK))
+			var resp map[string]string
+			Expect(json.Unmarshal(w.Body.Bytes(), &resp)).To(Succeed())
+			Expect(resp["message"]).To(ContainSubstring("cancelled"))
+
+			// Verify ImageBuild status was updated
+			updated := &automotivev1alpha1.ImageBuild{}
+			Expect(fakeClient.Get(context.Background(), types.NamespacedName{
+				Name: "my-build", Namespace: testNamespace,
+			}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Cancelled"))
+			Expect(updated.Status.Message).To(Equal("Build cancelled by user"))
+			Expect(updated.Status.CompletionTime).NotTo(BeNil())
+		})
+
+		It("should return 409 when PipelineRun already completed", func() {
+			build := newCancelTestBuild("Building", "my-build-pr")
+			completionTime := metav1.Now()
+			pipelineRun := &tektonv1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-build-pr",
+					Namespace: testNamespace,
+				},
+				Status: tektonv1.PipelineRunStatus{
+					PipelineRunStatusFields: tektonv1.PipelineRunStatusFields{
+						CompletionTime: &completionTime,
+					},
+				},
+			}
+			fakeClient := newCancelFakeClient(build, pipelineRun)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/my-build/cancel", nil)
+			c.Set("requester", "alice")
+
+			server.cancelBuild(c, "my-build")
+
+			Expect(w.Code).To(Equal(http.StatusConflict))
+			Expect(w.Body.String()).To(ContainSubstring("already completed"))
+		})
+
+		It("should cancel a building build and patch its PipelineRun", func() {
+			build := newCancelTestBuild("Building", "my-build-pr")
+			pipelineRun := &tektonv1.PipelineRun{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-build-pr",
+					Namespace: testNamespace,
+				},
+			}
+			fakeClient := newCancelFakeClient(build, pipelineRun)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds/my-build/cancel", nil)
+			c.Set("requester", "alice")
+
+			server.cancelBuild(c, "my-build")
+
+			Expect(w.Code).To(Equal(http.StatusOK))
+
+			// Verify PipelineRun was patched with Cancelled status
+			updatedPR := &tektonv1.PipelineRun{}
+			Expect(fakeClient.Get(context.Background(), types.NamespacedName{
+				Name: "my-build-pr", Namespace: testNamespace,
+			}, updatedPR)).To(Succeed())
+			Expect(string(updatedPR.Spec.Status)).To(Equal("Cancelled"))
+
+			// Verify ImageBuild status was updated
+			updated := &automotivev1alpha1.ImageBuild{}
+			Expect(fakeClient.Get(context.Background(), types.NamespacedName{
+				Name: "my-build", Namespace: testNamespace,
+			}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Cancelled"))
+			Expect(updated.Status.CompletionTime).NotTo(BeNil())
 		})
 	})
 

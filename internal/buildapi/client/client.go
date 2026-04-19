@@ -170,8 +170,16 @@ func (c *Client) GetBuild(ctx context.Context, name string) (*buildapi.BuildResp
 
 // DeleteBuild deletes an image build by name.
 func (c *Client) DeleteBuild(ctx context.Context, name string) error {
-	endpoint := c.resolve(path.Join("/v1/builds", url.PathEscape(name)))
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	return c.doBuildAction(ctx, http.MethodDelete, path.Join("/v1/builds", url.PathEscape(name)), "delete build")
+}
+
+// CancelBuild cancels an in-progress image build by name.
+func (c *Client) CancelBuild(ctx context.Context, name string) error {
+	return c.doBuildAction(ctx, http.MethodPost, path.Join("/v1/builds", url.PathEscape(name), "cancel"), "cancel build")
+}
+
+func (c *Client) doBuildAction(ctx context.Context, method, endpoint, action string) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.resolve(endpoint), nil)
 	if err != nil {
 		return err
 	}
@@ -185,7 +193,7 @@ func (c *Client) DeleteBuild(ctx context.Context, name string) error {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("delete build failed: %s: %s", resp.Status, string(b))
+		return fmt.Errorf("%s failed: %s: %s", action, resp.Status, string(b))
 	}
 	return nil
 }

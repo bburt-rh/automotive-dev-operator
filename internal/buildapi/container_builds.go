@@ -166,7 +166,7 @@ func (a *APIServer) streamContainerBuildLogs(c *gin.Context, name string) {
 		// Check if build is complete AND all pod logs have been streamed
 		if allPodsComplete {
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, cb); err == nil {
-				if cb.Status.Phase == phaseCompleted || cb.Status.Phase == phaseFailed {
+				if isTerminalPhase(cb.Status.Phase) {
 					break
 				}
 			}
@@ -459,7 +459,7 @@ func (a *APIServer) getContainerBuild(c *gin.Context, name string) {
 	buildOwner := cb.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]
 	if requester == buildOwner &&
 		cb.Spec.UseServiceAccountAuth &&
-		(cb.Status.Phase == phaseCompleted || cb.Status.Phase == phaseFailed) {
+		isTerminalPhase(cb.Status.Phase) {
 		token, _, tokenErr := a.mintRegistryToken(ctx, c, namespace)
 		if tokenErr != nil {
 			a.log.Error(tokenErr, "failed to mint registry token for container build", "build", name)

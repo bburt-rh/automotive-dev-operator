@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	common "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/registryauth"
 	buildapitypes "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
@@ -19,15 +20,18 @@ import (
 )
 
 const (
-	phaseCompleted = "Completed"
-	phaseFailed    = "Failed"
-	phaseFlashing  = "Flashing"
-	phasePending   = "Pending"
+	phaseCancelled = automotivev1alpha1.ImageBuildPhaseCancelled
+	phaseCompleted = automotivev1alpha1.ImageBuildPhaseCompleted
+	phaseFailed    = automotivev1alpha1.ImageBuildPhaseFailed
+	phaseFlashing  = automotivev1alpha1.ImageBuildPhaseFlashing
+	phasePending   = automotivev1alpha1.ImageBuildPhasePending
+	phaseUploading = automotivev1alpha1.ImageBuildPhaseUploading
 	phaseRunning   = "Running"
-	phaseUploading = "Uploading"
 
 	errPrefixFlash = "flash"
 )
+
+var isTerminalPhase = automotivev1alpha1.IsTerminalBuildPhase
 
 // Options wires build handlers to caller-owned state and helper functions.
 type Options struct {
@@ -818,9 +822,19 @@ func (h *Handler) handleFileUploads(
 
 // RunDelete handles `caib image delete`.
 func (h *Handler) RunDelete(_ *cobra.Command, args []string) {
-	ctx := context.Background()
-	buildName := args[0]
+	h.runBuildAction(args[0], "deleted", func(ctx context.Context, api *buildapiclient.Client, name string) error {
+		return api.DeleteBuild(ctx, name)
+	})
+}
 
+// RunCancel handles `caib image cancel`.
+func (h *Handler) RunCancel(_ *cobra.Command, args []string) {
+	h.runBuildAction(args[0], "cancelled", func(ctx context.Context, api *buildapiclient.Client, name string) error {
+		return api.CancelBuild(ctx, name)
+	})
+}
+
+func (h *Handler) runBuildAction(buildName, verb string, action func(context.Context, *buildapiclient.Client, string) error) {
 	if strings.TrimSpace(*h.opts.ServerURL) == "" {
 		h.handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
 		return
@@ -832,10 +846,10 @@ func (h *Handler) RunDelete(_ *cobra.Command, args []string) {
 		return
 	}
 
-	if err := api.DeleteBuild(ctx, buildName); err != nil {
+	if err := action(context.Background(), api, buildName); err != nil {
 		h.handleError(err)
 		return
 	}
 
-	fmt.Printf("Build %q deleted\n", buildName)
+	fmt.Printf("Build %q %s\n", buildName, verb)
 }

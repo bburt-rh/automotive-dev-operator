@@ -51,13 +51,16 @@ import (
 )
 
 const (
-	// Build phase constants
-	phaseCompleted = "Completed"
-	phaseFailed    = "Failed"
-	phasePending   = "Pending"
+	// Build phase constants — aliases for readability; canonical values in api/v1alpha1
+	phaseCancelled = automotivev1alpha1.ImageBuildPhaseCancelled
+	phaseCompleted = automotivev1alpha1.ImageBuildPhaseCompleted
+	phaseFailed    = automotivev1alpha1.ImageBuildPhaseFailed
+	phasePending   = automotivev1alpha1.ImageBuildPhasePending
+	phaseUploading = automotivev1alpha1.ImageBuildPhaseUploading
+	phaseBuilding  = automotivev1alpha1.ImageBuildPhaseBuilding
+	phasePushing   = automotivev1alpha1.ImageBuildPhasePushing
+	phaseFlashing  = automotivev1alpha1.ImageBuildPhaseFlashing
 	phaseRunning   = "Running"
-	phaseUploading = "Uploading"
-	phaseBuilding  = "Building"
 
 	// Image format and compression constants
 	formatImage     = "image"
@@ -571,6 +574,7 @@ func (a *APIServer) createRouter() *gin.Engine {
 			buildsGroup.GET("/:name/template", a.handleGetBuildTemplate)
 			buildsGroup.POST("/:name/uploads", a.handleUploadFiles)
 			buildsGroup.POST("/:name/token", a.handleCreateBuildToken)
+			buildsGroup.POST("/:name/cancel", a.handleCancelBuild)
 			buildsGroup.DELETE("/:name", a.handleDeleteBuild)
 		}
 
@@ -809,7 +813,6 @@ func (a *APIServer) deleteBuild(c *gin.Context, name string) {
 		return
 	}
 
-	// Verify the requesting user owns this build
 	requester := a.resolveRequester(c)
 	owner := build.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]
 	if owner != requester {
@@ -817,7 +820,7 @@ func (a *APIServer) deleteBuild(c *gin.Context, name string) {
 		return
 	}
 
-	// If the build used the internal registry, clean up its ImageStream tags.
+	// Clean up ImageStream tags created by this build before deleting
 	// Only delete the specific tags this build created; if the stream becomes
 	// empty afterwards, delete the whole ImageStream.
 	if build.Spec.GetUseServiceAccountAuth() {
@@ -854,6 +857,90 @@ func (a *APIServer) deleteBuild(c *gin.Context, name string) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("build %q deleted", name)})
+}
+
+func (a *APIServer) handleCancelBuild(c *gin.Context) {
+	name := c.Param("name")
+	a.log.Info("cancel build", "name", name, "reqID", c.GetString("reqID"))
+	a.cancelBuild(c, name)
+}
+
+func (a *APIServer) cancelBuild(c *gin.Context, name string) {
+	k8sClient, err := getClientFromRequestFn(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
+		return
+	}
+
+	namespace := resolveNamespace()
+	ctx := c.Request.Context()
+
+	build := &automotivev1alpha1.ImageBuild{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, build); err != nil {
+		if k8serrors.IsNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "build not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error fetching build: %v", err)})
+		return
+	}
+
+	requester := a.resolveRequester(c)
+	owner := build.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]
+	if owner != requester {
+		c.JSON(http.StatusForbidden, gin.H{"error": "you can only cancel your own builds"})
+		return
+	}
+
+	switch build.Status.Phase {
+	case "", phasePending, phaseUploading, phaseBuilding, phasePushing, phaseFlashing:
+		// cancellable
+	default:
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("build is in %q phase and cannot be cancelled", build.Status.Phase),
+		})
+		return
+	}
+
+	if build.Status.PipelineRunName != "" {
+		pipelineRun := &tektonv1.PipelineRun{}
+		prKey := types.NamespacedName{Name: build.Status.PipelineRunName, Namespace: namespace}
+		if err := k8sClient.Get(ctx, prKey, pipelineRun); err != nil {
+			if !k8serrors.IsNotFound(err) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error fetching PipelineRun: %v", err)})
+				return
+			}
+		} else if pipelineRun.Status.CompletionTime != nil {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "build has already completed; refresh and retry",
+			})
+			return
+		} else {
+			pipelineRun.Spec.Status = tektonv1.PipelineRunSpecStatusCancelled
+			if err := k8sClient.Update(ctx, pipelineRun); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to cancel PipelineRun: %v", err)})
+				return
+			}
+		}
+	}
+
+	build.Status.Phase = phaseCancelled
+	build.Status.Message = "Build cancelled by user"
+	now := metav1.Now()
+	if build.Status.CompletionTime == nil {
+		build.Status.CompletionTime = &now
+	}
+	if err := k8sClient.Status().Update(ctx, build); err != nil {
+		// Controller may have already set phase to Cancelled after seeing the PipelineRun cancel
+		if k8serrors.IsConflict(err) {
+			c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("build %q cancelled", name)})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update build status: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("build %q cancelled", name)})
 }
 
 // resolveImageStreamRefs extracts the ImageStream name and the set of tags
@@ -1232,6 +1319,8 @@ func (a *APIServer) streamLogs(c *gin.Context, name string) {
 	writeLogStreamFooter(c, hadStream)
 }
 
+var isTerminalPhase = automotivev1alpha1.IsTerminalBuildPhase
+
 // shouldExitLogStream checks if the log streaming loop should exit
 func shouldExitLogStream(
 	ctx context.Context,
@@ -1241,7 +1330,7 @@ func shouldExitLogStream(
 	allPodsComplete bool,
 ) bool {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ib); err == nil {
-		if (ib.Status.Phase == phaseCompleted || ib.Status.Phase == phaseFailed) && allPodsComplete {
+		if isTerminalPhase(ib.Status.Phase) && allPodsComplete {
 			return true
 		}
 	}
@@ -2252,7 +2341,7 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 	// For terminal builds, include Jumpstarter mapping so the CLI can show
 	// manual flash guidance after successful or failed flash attempts.
 	var jumpstarterInfo *JumpstarterInfo
-	if build.Status.Phase == phaseCompleted || build.Status.Phase == phaseFailed {
+	if isTerminalPhase(build.Status.Phase) {
 		operatorConfig := &automotivev1alpha1.OperatorConfig{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: "config", Namespace: namespace}, operatorConfig); err == nil {
 			if operatorConfig.Status.JumpstarterAvailable {
@@ -2293,7 +2382,7 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 	buildOwner := build.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]
 	if requester == buildOwner &&
 		build.Spec.GetUseServiceAccountAuth() &&
-		(build.Status.Phase == phaseCompleted || build.Status.Phase == phaseFailed) {
+		isTerminalPhase(build.Status.Phase) {
 		var tokenErr error
 		registryToken, _, tokenErr = a.mintRegistryToken(ctx, c, namespace)
 		if tokenErr != nil {

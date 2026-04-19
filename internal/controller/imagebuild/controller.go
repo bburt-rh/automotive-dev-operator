@@ -41,10 +41,11 @@ const (
 	// OperatorNamespace is the namespace where the operator is deployed.
 	OperatorNamespace = "automotive-dev-operator-system"
 
-	// Phase constants for ImageBuild status
-	phaseBuilding  = "Building"
-	phaseCompleted = "Completed"
-	phaseFailed    = "Failed"
+	// Phase constants — aliases for readability; canonical values in api/v1alpha1
+	phaseBuilding  = automotivev1alpha1.ImageBuildPhaseBuilding
+	phaseCancelled = automotivev1alpha1.ImageBuildPhaseCancelled
+	phaseCompleted = automotivev1alpha1.ImageBuildPhaseCompleted
+	phaseFailed    = automotivev1alpha1.ImageBuildPhaseFailed
 
 	// Tekton condition type for completion status
 	conditionSucceeded = "Succeeded"
@@ -69,6 +70,8 @@ const (
 	eventReasonDiskBuildFailed  = "DiskBuildFailed"
 	eventReasonDiskBuildDone    = "DiskBuildCompleted"
 )
+
+var isTerminalPhase = automotivev1alpha1.IsTerminalBuildPhase
 
 // safeDerivedName generates a Kubernetes-safe derived resource name by truncating
 // the base name and appending a hash to preserve uniqueness. The final name will
@@ -153,8 +156,10 @@ func (r *ImageBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return r.handleFlashingState(ctx, imageBuild)
 	case phaseCompleted:
 		return r.handleCompletedState(ctx, imageBuild)
-	case phaseFailed:
-		// Retry cleanup of any transient secrets that failed to delete.
+	case phaseCancelled, phaseFailed:
+		if err := r.shutdownUploadPod(ctx, imageBuild); err != nil {
+			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, err
+		}
 		if err := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); err != nil {
 			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
 		}
@@ -488,8 +493,25 @@ func (r *ImageBuildReconciler) checkBuildProgress(
 		return ctrl.Result{}, nil
 	}
 
-	// Build failed - cleanup transient secrets
 	cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, r.Log)
+
+	if pipelineRun.Spec.Status == tektonv1.PipelineRunSpecStatusCancelled {
+		if imageBuild.Status.Phase == phaseCancelled {
+			if cleanupErr != nil {
+				return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+			}
+			return ctrl.Result{}, nil
+		}
+		if err := r.updateStatus(ctx, imageBuild, phaseCancelled, "Build cancelled by user"); err != nil {
+			log.Error(err, "Failed to update status to Cancelled")
+			return ctrl.Result{}, err
+		}
+		recordBuildMetrics(imageBuild, pipelineRun, buildStatusFailure)
+		if cleanupErr != nil {
+			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+		}
+		return ctrl.Result{}, nil
+	}
 
 	if err := r.updateStatus(ctx, imageBuild, phaseFailed, r.pipelineRunFailureDetail(ctx, pipelineRun)); err != nil {
 		log.Error(err, "Failed to update status to Failed")
@@ -2076,6 +2098,10 @@ func (r *ImageBuildReconciler) updateStatus(
 		return err
 	}
 
+	if fresh.Status.Phase == phaseCancelled && phase != phaseCancelled {
+		return nil
+	}
+
 	patch := client.MergeFrom(fresh.DeepCopy())
 	oldPhase := fresh.Status.Phase
 	oldMessage := fresh.Status.Message
@@ -2086,7 +2112,7 @@ func (r *ImageBuildReconciler) updateStatus(
 	if phase == phaseBuilding && fresh.Status.StartTime == nil {
 		now := metav1.Now()
 		fresh.Status.StartTime = &now
-	} else if (phase == phaseCompleted || phase == phaseFailed) && fresh.Status.CompletionTime == nil {
+	} else if isTerminalPhase(phase) && fresh.Status.CompletionTime == nil {
 		now := metav1.Now()
 		fresh.Status.CompletionTime = &now
 	}

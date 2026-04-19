@@ -26,6 +26,7 @@ type Options struct {
 	RunInjectSigned      func(*cobra.Command, []string)
 	RunToken             func(*cobra.Command, []string)
 	RunDelete            func(*cobra.Command, []string)
+	RunCancel            func(*cobra.Command, []string)
 
 	GetDefaultArch func() string
 
@@ -107,6 +108,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 
 	tokenCmd := newTokenCmd(opts)
 	deleteCmd := newDeleteCmd(opts)
+	cancelCmd := newCancelCmd(opts)
 
 	prepareResealCmd := newPrepareResealCmd(opts)
 	resealCmd := newResealCmd(opts)
@@ -282,6 +284,10 @@ func NewImageCmd(opts Options) *cobra.Command {
 	deleteCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	deleteCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 
+	// cancel command flags
+	cancelCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
+	cancelCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
+
 	// flash command flags
 	flashCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	flashCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
@@ -317,6 +323,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 		logsCmd,
 		tokenCmd,
 		deleteCmd,
+		cancelCmd,
 		flashCmd,
 		prepareResealCmd,
 		resealCmd,
@@ -520,6 +527,28 @@ Examples:
   caib image delete my-internal-build`,
 		Args: cobra.ExactArgs(1),
 		Run:  opts.RunDelete,
+	}
+}
+
+func newCancelCmd(opts Options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel <build-name>",
+		Short: "Cancel an in-progress build",
+		Long: `Cancel stops an in-progress build by cancelling its Tekton PipelineRun.
+The ImageBuild resource is preserved so you can inspect its logs and status.
+
+Only builds in Pending, Uploading, or Building phase can be cancelled.
+You can only cancel builds that you created.
+
+Examples:
+  # Cancel a running build
+  caib image cancel my-build
+
+  # List builds first, then cancel one
+  caib image list
+  caib image cancel <build-name>`,
+		Args: cobra.ExactArgs(1),
+		Run:  opts.RunCancel,
 	}
 }
 

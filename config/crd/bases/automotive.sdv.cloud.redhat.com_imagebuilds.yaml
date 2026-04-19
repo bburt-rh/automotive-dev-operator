@@ -313,7 +313,7 @@ spec:
                 type: integer
               phase:
                 description: Phase represents the current phase of the build (Building,
-                  Completed, Failed)
+                  Completed, Failed, Cancelled)
                 enum:
                 - Pending
                 - Uploading
@@ -322,6 +322,7 @@ spec:
                 - Flashing
                 - Completed
                 - Failed
+                - Cancelled
                 type: string
               pipelineRunName:
                 description: PipelineRunName is the name of the active PipelineRun

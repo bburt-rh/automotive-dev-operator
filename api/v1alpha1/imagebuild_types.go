@@ -20,6 +20,23 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ImageBuild phase constants for Status.Phase.
+const (
+	ImageBuildPhasePending   = "Pending"
+	ImageBuildPhaseUploading = "Uploading"
+	ImageBuildPhaseBuilding  = "Building"
+	ImageBuildPhasePushing   = "Pushing"
+	ImageBuildPhaseFlashing  = "Flashing"
+	ImageBuildPhaseCompleted = "Completed"
+	ImageBuildPhaseFailed    = "Failed"
+	ImageBuildPhaseCancelled = "Cancelled"
+)
+
+// IsTerminalBuildPhase reports whether phase is a final build state.
+func IsTerminalBuildPhase(phase string) bool {
+	return phase == ImageBuildPhaseCompleted || phase == ImageBuildPhaseFailed || phase == ImageBuildPhaseCancelled
+}
+
 // ImageBuildSpec defines the desired state of ImageBuild
 // +kubebuilder:printcolumn:name="StorageClass",type=string,JSONPath=`.spec.storageClass`
 type ImageBuildSpec struct {
@@ -196,8 +213,8 @@ type ImageBuildStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Phase represents the current phase of the build (Building, Completed, Failed)
-	// +kubebuilder:validation:Enum=Pending;Uploading;Building;Pushing;Flashing;Completed;Failed
+	// Phase represents the current phase of the build (Building, Completed, Failed, Cancelled)
+	// +kubebuilder:validation:Enum=Pending;Uploading;Building;Pushing;Flashing;Completed;Failed;Cancelled
 	Phase string `json:"phase,omitempty"`
 
 	// StartTime is when the build started
