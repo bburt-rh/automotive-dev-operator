@@ -215,6 +215,13 @@ spec:
                   used for this build. Set automatically by the Build API from the
                   OperatorConfig at request time to prevent TOCTOU races.
                 type: string
+              ttl:
+                description: |-
+                  TTL is the time-to-live for this build. The build is automatically deleted
+                  after this duration past its completion (or creation if still in progress).
+                  Uses Go duration format (e.g. "24h", "72h", "168h").
+                  Empty uses the OperatorConfig default. Set to "0" to disable expiry.
+                type: string
               workspace:
                 description: |-
                   Workspace is the name of the Workspace CR this build belongs to.
@@ -296,6 +303,12 @@ spec:
                   - type
                   type: object
                 type: array
+              expiresAt:
+                description: |-
+                  ExpiresAt is when this build will be automatically deleted.
+                  Nil if expiry is disabled (TTL "0" or no-expire annotation).
+                format: date-time
+                type: string
               flashTaskRunName:
                 description: FlashTaskRunName is the name of the TaskRun for flashing
                   to hardware

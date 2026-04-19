@@ -170,6 +170,9 @@ components:
           type: array
           items:
             type: string
+        ttl:
+          type: string
+          description: 'Time-to-live for the build (e.g. "24h", "72h"). Empty uses server default, "0" disables expiry.'
     BuildResponse:
       type: object
       properties:
@@ -179,6 +182,10 @@ components:
           type: string
         message:
           type: string
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the build will be automatically deleted (RFC 3339)
     BuildListItem:
       type: object
       properties:

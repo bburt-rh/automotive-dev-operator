@@ -57,6 +57,7 @@ const (
 var digestPinnedRef = regexp.MustCompile(`^.+@sha256:[a-fA-F0-9]{64}$`)
 
 const (
+	eventReasonBuildExpired     = "BuildExpired"
 	eventReasonPhaseChanged     = "PhaseChanged"
 	eventReasonPipelineRunReady = "PipelineRunReady"
 	eventReasonUploadPodReady   = "UploadPodReady"
@@ -140,34 +141,45 @@ func (r *ImageBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	expiryResult, expired, err := r.checkExpiry(ctx, imageBuild)
+	if expired || err != nil {
+		return expiryResult, err
+	}
+
+	var phaseResult ctrl.Result
 	switch imageBuild.Status.Phase {
 	case "":
-		return r.handleInitialState(ctx, imageBuild)
+		phaseResult, err = r.handleInitialState(ctx, imageBuild)
 	case "Uploading":
-		return r.handleUploadingState(ctx, imageBuild)
+		phaseResult, err = r.handleUploadingState(ctx, imageBuild)
 	case phaseBuilding:
-		return r.handleBuildingState(ctx, imageBuild)
+		phaseResult, err = r.handleBuildingState(ctx, imageBuild)
 	case "Pushing":
-		// Legacy phase - push is now part of the pipeline
-		return r.handlePushingState(ctx, imageBuild)
+		phaseResult, err = r.handlePushingState(ctx, imageBuild)
 	case "Flashing":
-		// Legacy phase - flash is now part of the pipeline
-		// Handle gracefully for any in-progress builds from before this change
-		return r.handleFlashingState(ctx, imageBuild)
+		phaseResult, err = r.handleFlashingState(ctx, imageBuild)
 	case phaseCompleted:
-		return r.handleCompletedState(ctx, imageBuild)
+		phaseResult = r.handleCompletedState(ctx, imageBuild)
 	case phaseCancelled, phaseFailed:
-		if err := r.shutdownUploadPod(ctx, imageBuild); err != nil {
-			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, err
+		if shutdownErr := r.shutdownUploadPod(ctx, imageBuild); shutdownErr != nil {
+			log.Error(shutdownErr, "Failed to shutdown upload pod, will retry")
+			phaseResult = ctrl.Result{RequeueAfter: secretCleanupRequeue}
+		} else if cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); cleanupErr != nil {
+			log.Error(cleanupErr, "Failed to cleanup transient secrets, will retry")
+			phaseResult = ctrl.Result{RequeueAfter: secretCleanupRequeue}
 		}
-		if err := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); err != nil {
-			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
-		}
-		return ctrl.Result{}, nil
 	default:
 		log.Info("Unknown phase", "phase", imageBuild.Status.Phase)
-		return ctrl.Result{}, nil
 	}
+	if err != nil {
+		return phaseResult, err
+	}
+
+	if expiryResult.RequeueAfter > 0 &&
+		(phaseResult.RequeueAfter == 0 || expiryResult.RequeueAfter < phaseResult.RequeueAfter) {
+		phaseResult.RequeueAfter = expiryResult.RequeueAfter
+	}
+	return phaseResult, nil
 }
 
 // ensureImageStreamOwnerRef adds a non-controller owner reference from the
@@ -387,6 +399,136 @@ func (r *ImageBuildReconciler) handleBuildingState(
 	return r.startNewBuild(ctx, imageBuild)
 }
 
+// checkExpiry returns (result, expired, error). Caller should return immediately if expired.
+func (r *ImageBuildReconciler) checkExpiry(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (ctrl.Result, bool, error) {
+	log := r.Log.WithValues(
+		"imagebuild",
+		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
+	)
+
+	if imageBuild.Annotations[automotivev1alpha1.NoExpireAnnotation] == "true" {
+		if err := r.updateExpiresAt(ctx, imageBuild, nil); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{}, false, nil
+	}
+
+	ttl, err := r.resolveEffectiveTTL(ctx, imageBuild)
+	if err != nil {
+		log.Error(err, "Failed to resolve TTL, skipping expiry check")
+		r.emitEventf(imageBuild, corev1.EventTypeWarning, "InvalidTTL",
+			"Failed to resolve TTL, expiry disabled for this build: %v", err)
+		return ctrl.Result{}, false, nil
+	}
+	if ttl == 0 {
+		if err := r.updateExpiresAt(ctx, imageBuild, nil); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{}, false, nil
+	}
+
+	var anchor time.Time
+	if imageBuild.Status.CompletionTime != nil {
+		anchor = imageBuild.Status.CompletionTime.Time
+	} else {
+		anchor = imageBuild.CreationTimestamp.Time
+	}
+
+	expiresAt := anchor.Add(ttl)
+	remaining := time.Until(expiresAt)
+
+	if err := r.updateExpiresAt(ctx, imageBuild, &expiresAt); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	if remaining > 0 {
+		log.Info("Build not yet expired", "expiresAt", expiresAt, "remaining", remaining.Truncate(time.Second))
+		return ctrl.Result{RequeueAfter: remaining}, false, nil
+	}
+
+	log.Info("Build expired, deleting", "ttl", ttl, "anchor", anchor)
+	r.emitEventf(imageBuild, corev1.EventTypeNormal, eventReasonBuildExpired,
+		"Build expired after %s, deleting", ttl)
+
+	if err := r.Delete(ctx, imageBuild); err != nil {
+		if !errors.IsNotFound(err) {
+			return ctrl.Result{}, false, fmt.Errorf("failed to delete expired build: %w", err)
+		}
+	}
+	return ctrl.Result{}, true, nil
+}
+
+// resolveEffectiveTTL returns 0 if expiry is disabled.
+func (r *ImageBuildReconciler) resolveEffectiveTTL(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (time.Duration, error) {
+	ttlStr := imageBuild.Spec.GetTTL()
+
+	if ttlStr == "" {
+		operatorConfig := &automotivev1alpha1.OperatorConfig{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name: "config", Namespace: OperatorNamespace,
+		}, operatorConfig); err != nil {
+			if !errors.IsNotFound(err) {
+				return 0, fmt.Errorf("failed to load OperatorConfig: %w", err)
+			}
+			ttlStr = automotivev1alpha1.DefaultBuildTTL
+		} else if operatorConfig.Spec.OSBuilds != nil {
+			ttlStr = operatorConfig.Spec.OSBuilds.GetDefaultBuildTTL()
+		} else {
+			ttlStr = automotivev1alpha1.DefaultBuildTTL
+		}
+	}
+
+	if ttlStr == "0" {
+		return 0, nil
+	}
+
+	ttl, err := time.ParseDuration(ttlStr)
+	if err != nil {
+		return 0, err
+	}
+	if ttl < 0 {
+		return 0, fmt.Errorf("TTL must not be negative: %s", ttlStr)
+	}
+	return ttl, nil
+}
+
+// updateExpiresAt sets or clears status.ExpiresAt. Pass nil to clear.
+func (r *ImageBuildReconciler) updateExpiresAt(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	expiresAt *time.Time,
+) error {
+	var desired *metav1.Time
+	if expiresAt != nil {
+		truncated := expiresAt.Truncate(time.Second)
+		t := metav1.NewTime(truncated)
+		desired = &t
+	}
+
+	if imageBuild.Status.ExpiresAt == nil && desired == nil {
+		return nil
+	}
+	if imageBuild.Status.ExpiresAt != nil && desired != nil &&
+		imageBuild.Status.ExpiresAt.Time.Equal(desired.Time) {
+		return nil
+	}
+
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: imageBuild.Name, Namespace: imageBuild.Namespace,
+	}, fresh); err != nil {
+		return err
+	}
+	fresh.Status.ExpiresAt = desired
+	return r.Status().Update(ctx, fresh)
+}
+
 // secretCleanupRequeue is the interval for retrying transient secret deletion
 // in terminal state handlers.
 const secretCleanupRequeue = 30 * time.Second
@@ -394,13 +536,11 @@ const secretCleanupRequeue = 30 * time.Second
 func (r *ImageBuildReconciler) handleCompletedState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	// Retry cleanup of any transient secrets that failed to delete when
-	// the build first reached terminal state.
+) ctrl.Result {
 	if err := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); err != nil {
-		return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+		return ctrl.Result{RequeueAfter: secretCleanupRequeue}
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}
 }
 
 func (r *ImageBuildReconciler) checkBuildProgress(

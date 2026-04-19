@@ -62,6 +62,9 @@ var (
 	// Secure build
 	secureBuild bool
 
+	// Build TTL
+	buildTTL string
+
 	// TLS options
 	insecureSkipTLS bool
 

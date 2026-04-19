@@ -60,6 +60,12 @@ const (
 	// DefaultAutoPauseTimeoutMinutes is the default idle timeout in minutes before a workspace is auto-paused
 	DefaultAutoPauseTimeoutMinutes int32 = 30
 
+	// DefaultBuildTTL is the default time-to-live for builds (all phases, including in-progress).
+	DefaultBuildTTL = "24h"
+
+	// NoExpireAnnotation prevents automatic expiry when set to "true" on an ImageBuild
+	NoExpireAnnotation = "automotive.sdv.cloud.redhat.com/no-expire"
+
 	// BuildServiceAccountName is the dedicated SA used by build pods and token minting.
 	// Using a dedicated SA avoids collisions with the shared "pipeline" SA.
 	BuildServiceAccountName = "ado-build"
@@ -543,6 +549,19 @@ type OSBuildsConfig struct {
 	// Example: "quay.io/rh-sdv-cloud/automotive-dev-tekton-tasks:v0.1.0@sha256:abc123..."
 	// +optional
 	TaskBundleRef string `json:"taskBundleRef,omitempty"`
+
+	// DefaultBuildTTL is the default time-to-live for builds (all phases, including in-progress).
+	// Builds are automatically deleted after this duration. Uses Go duration format (e.g. "24h", "72h").
+	// Set to "0" to disable expiry by default.
+	// Default: "24h"
+	// +optional
+	DefaultBuildTTL string `json:"defaultBuildTTL,omitempty"`
+
+	// MaxBuildTTL is the maximum TTL that users can request for individual builds.
+	// Build requests specifying a TTL greater than this value are rejected.
+	// Set to "0" for no maximum. Uses Go duration format (e.g. "168h" for 1 week).
+	// +optional
+	MaxBuildTTL string `json:"maxBuildTTL,omitempty"`
 }
 
 // CertificateSourceRef references a Secret or ConfigMap that contains trusted CA certificates.
@@ -576,6 +595,22 @@ func (c *OSBuildsConfig) GetFlashTimeoutMinutes() int32 {
 		return c.FlashTimeoutMinutes
 	}
 	return DefaultFlashTimeoutMinutes
+}
+
+// GetDefaultBuildTTL returns the default build TTL string, falling back to the hardcoded default
+func (c *OSBuildsConfig) GetDefaultBuildTTL() string {
+	if c != nil && c.DefaultBuildTTL != "" {
+		return c.DefaultBuildTTL
+	}
+	return DefaultBuildTTL
+}
+
+// GetMaxBuildTTL returns the max build TTL string, or empty if no max is set
+func (c *OSBuildsConfig) GetMaxBuildTTL() string {
+	if c != nil {
+		return c.MaxBuildTTL
+	}
+	return ""
 }
 
 // GetUsePVCScratchVolumes returns whether to use PVC-backed scratch volumes (default: true)

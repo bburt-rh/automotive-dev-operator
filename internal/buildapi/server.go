@@ -1594,6 +1594,45 @@ func validateBuildRequest(req *BuildRequest) error {
 	return nil
 }
 
+// resolveAndClampTTL validates the requested TTL and enforces MaxBuildTTL if configured.
+func resolveAndClampTTL(ctx context.Context, k8sClient client.Client, namespace, requestedTTL string) (string, error) {
+	if requestedTTL == "" {
+		return requestedTTL, nil
+	}
+	if requestedTTL != "0" {
+		dur, err := time.ParseDuration(requestedTTL)
+		if err != nil {
+			return "", fmt.Errorf("invalid TTL %q: %w", requestedTTL, err)
+		}
+		if dur < 0 {
+			return "", fmt.Errorf("TTL must not be negative")
+		}
+	}
+	operatorCfg, cfgErr := loadOperatorConfigFn(ctx, k8sClient, namespace)
+	if cfgErr != nil && !k8serrors.IsNotFound(cfgErr) {
+		return "", fmt.Errorf("failed to load OperatorConfig: %w", cfgErr)
+	}
+	if operatorCfg != nil && operatorCfg.Spec.OSBuilds != nil {
+		if maxStr := operatorCfg.Spec.OSBuilds.GetMaxBuildTTL(); maxStr != "" && maxStr != "0" {
+			maxDur, parseErr := time.ParseDuration(maxStr)
+			if parseErr != nil {
+				return "", fmt.Errorf("invalid MaxBuildTTL %q in OperatorConfig: %w", maxStr, parseErr)
+			}
+			if maxDur <= 0 {
+				return "", fmt.Errorf("MaxBuildTTL must be positive, got %q", maxStr)
+			}
+			if requestedTTL == "0" {
+				return "", fmt.Errorf("no-expiry (TTL \"0\") is not allowed when MaxBuildTTL is set (%s)", maxStr)
+			}
+			dur, _ := time.ParseDuration(requestedTTL)
+			if dur > maxDur {
+				return "", fmt.Errorf("requested TTL %q exceeds maximum %q", requestedTTL, maxStr)
+			}
+		}
+	}
+	return requestedTTL, nil
+}
+
 // applyBuildDefaults sets default values for build request fields
 func applyBuildDefaults(req *BuildRequest) error {
 	if req.Distro == "" {
@@ -2065,27 +2104,6 @@ func (a *APIServer) createBuild(c *gin.Context) {
 		return
 	}
 
-	// Resolve --extra-repo workspace:path pairs into extra_repos custom defines
-	if len(req.ExtraRepos) > 0 {
-		k8sClientForRepos, err := getClientFromRequest(c)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
-			return
-		}
-		restCfgForRepos, err := getRESTConfigFromRequest(c)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get kubernetes config"})
-			return
-		}
-		if err := a.resolveExtraRepos(c.Request.Context(), k8sClientForRepos, restCfgForRepos, &req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-	}
-
-	// Append a short random suffix to ensure unique names for parallel builds
-	req.Name = fmt.Sprintf("%s-%s", req.Name, uuid.New().String()[:5])
-
 	k8sClient, err := getClientFromRequest(c)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("k8s client error: %v", err)})
@@ -2094,6 +2112,29 @@ func (a *APIServer) createBuild(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	namespace := resolveNamespace()
+
+	effectiveTTL, ttlErr := resolveAndClampTTL(ctx, k8sClient, namespace, req.TTL)
+	if ttlErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": ttlErr.Error()})
+		return
+	}
+
+	// Resolve --extra-repo workspace:path pairs into extra_repos custom defines
+	if len(req.ExtraRepos) > 0 {
+		restCfgForRepos, err := getRESTConfigFromRequest(c)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get kubernetes config"})
+			return
+		}
+		if err := a.resolveExtraRepos(ctx, k8sClient, restCfgForRepos, &req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	// Append a short random suffix to ensure unique names for parallel builds
+	req.Name = fmt.Sprintf("%s-%s", req.Name, uuid.New().String()[:5])
+
 	requestedBy := a.resolveRequester(c)
 
 	// Validate secureBuild requirements early, before creating any resources.
@@ -2190,6 +2231,7 @@ func (a *APIServer) createBuild(c *gin.Context) {
 			Workspace:     req.Workspace,
 			SecureBuild:   req.SecureBuild,
 			TaskBundleRef: taskBundleRef,
+			TTL:           effectiveTTL,
 		},
 	}
 	if err := k8sClient.Create(ctx, imageBuild); err != nil {
@@ -2417,7 +2459,13 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 		DiskImage:      diskImage,
 		RegistryToken:  registryToken,
 		Warning:        warning,
-		Jumpstarter:    jumpstarterInfo,
+		ExpiresAt: func() string {
+			if build.Status.ExpiresAt != nil {
+				return build.Status.ExpiresAt.Format(time.RFC3339)
+			}
+			return ""
+		}(),
+		Jumpstarter: jumpstarterInfo,
 		Parameters: &BuildParameters{
 			Architecture:           build.Spec.Architecture,
 			Distro:                 build.Spec.GetDistro(),
@@ -2481,6 +2529,7 @@ func getBuildTemplate(c *gin.Context, name string) {
 			AIBExtraArgs:           build.Spec.GetAIBExtraArgs(),
 			Compression:            build.Spec.GetCompression(),
 			SecureBuild:            build.Spec.SecureBuild,
+			TTL:                    build.Spec.GetTTL(),
 		},
 		SourceFiles: sourceFiles,
 	})
