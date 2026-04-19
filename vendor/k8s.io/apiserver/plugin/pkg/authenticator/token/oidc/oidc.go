@@ -27,17 +27,16 @@ oidc implements the authenticator.Token interface using the OpenID Connect proto
 package oidc
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
-	"mime"
+	"io/ioutil"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,11 +44,11 @@ import (
 
 	"github.com/coreos/go-oidc"
 	celgo "github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
-	"github.com/google/cel-go/common/types/traits"
-	jose "gopkg.in/go-jose/go-jose.v2"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -59,11 +58,6 @@ import (
 	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
 	authenticationtokenjwt "k8s.io/apiserver/pkg/authentication/token/jwt"
 	"k8s.io/apiserver/pkg/authentication/user"
-	"k8s.io/apiserver/pkg/cel"
-	"k8s.io/apiserver/pkg/cel/lazy"
-	"k8s.io/apiserver/pkg/features"
-	"k8s.io/apiserver/pkg/server/egressselector"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/klog/v2"
 )
@@ -84,19 +78,12 @@ type Options struct {
 
 	// Optional KeySet to allow for synchronous initialization instead of fetching from the remote issuer.
 	// Mutually exclusive with JWTAuthenticator.Issuer.DiscoveryURL.
-	//
-	// The following API server metrics for fetching JWKS and provider status will not be recorded if this is set.
-	//  - apiserver_authentication_jwt_authenticator_jwks_fetch_last_timestamp_seconds
-	//  - apiserver_authentication_jwt_authenticator_jwks_fetch_last_key_set_info
 	KeySet oidc.KeySet
 
 	// PEM encoded root certificate contents of the provider.  Mutually exclusive with Client.
 	CAContentProvider CAContentProvider
 
-	// EgressLookup allows for optional opt-in egress configuration via a custom dialer.  Mutually exclusive with Client.
-	EgressLookup egressselector.Lookup
-
-	// Optional http.Client used to make all requests to the remote issuer.  Mutually exclusive with CAContentProvider and EgressLookup.
+	// Optional http.Client used to make all requests to the remote issuer.  Mutually exclusive with CAContentProvider.
 	Client *http.Client
 
 	// Optional CEL compiler used to compile the CEL expressions. This is useful to use a shared instance
@@ -117,10 +104,6 @@ type Options struct {
 	SupportedSigningAlgs []string
 
 	DisallowedIssuers []string
-
-	// APIServerID is the ID of the API server
-	// This is used in metrics to identify the API server
-	APIServerID string
 
 	// now is used for testing. It defaults to time.Now.
 	now func() time.Time
@@ -277,7 +260,6 @@ func New(lifecycleCtx context.Context, opts Options) (AuthenticatorTokenWithHeal
 		return nil, err
 	}
 
-	RegisterMetrics()
 	supportedSigningAlgs := opts.SupportedSigningAlgs
 	if len(supportedSigningAlgs) == 0 {
 		// RS256 is the default recommended by OpenID Connect and an 'alg' value
@@ -292,10 +274,6 @@ func New(lifecycleCtx context.Context, opts Options) (AuthenticatorTokenWithHeal
 
 	if opts.Client != nil && opts.CAContentProvider != nil {
 		return nil, fmt.Errorf("oidc: Client and CAContentProvider are mutually exclusive")
-	}
-
-	if opts.Client != nil && opts.EgressLookup != nil {
-		return nil, fmt.Errorf("oidc: Client and EgressLookup are mutually exclusive")
 	}
 
 	client := opts.Client
@@ -313,25 +291,8 @@ func New(lifecycleCtx context.Context, opts Options) (AuthenticatorTokenWithHeal
 			klog.Info("OIDC: No x509 certificates provided, will use host's root CA set")
 		}
 
-		var customDial net.DialFunc
-		switch et := opts.JWTAuthenticator.Issuer.EgressSelectorType; et {
-		case "":
-			// valid but nothing to do
-		case apiserver.EgressSelectorControlPlane:
-			customDial, err = egressLookupForType(opts.EgressLookup, egressselector.ControlPlane)
-		case apiserver.EgressSelectorCluster:
-			customDial, err = egressLookupForType(opts.EgressLookup, egressselector.Cluster)
-		default:
-			// this should be impossible as validation should catch this at an earlier point
-			return nil, fmt.Errorf("oidc: unknown egress selector type %q", et)
-		}
-		if err != nil {
-			return nil, err
-		}
-
 		// Copied from http.DefaultTransport.
 		tr := net.SetTransportDefaults(&http.Transport{
-			DialContext: customDial,
 			// According to golang's doc, if RootCAs is nil,
 			// TLS uses the host's root CA set.
 			TLSClientConfig: &tls.Config{RootCAs: roots},
@@ -435,31 +396,6 @@ func New(lifecycleCtx context.Context, opts Options) (AuthenticatorTokenWithHeal
 					return false, nil
 				}
 
-				if utilfeature.DefaultFeatureGate.Enabled(features.StructuredAuthenticationConfigurationJWKSMetrics) {
-					providerJSON := &struct {
-						JWKSURL string `json:"jwks_uri"`
-					}{}
-
-					if err := provider.Claims(providerJSON); err != nil {
-						klog.Errorf("oidc authenticator: error getting JWKS URL: %v", err)
-						authn.healthCheck.Store(&errorHolder{err: err})
-						return false, nil
-					}
-					if len(providerJSON.JWKSURL) == 0 {
-						klog.Errorf("provider did not return JWKS URL")
-						authn.healthCheck.Store(&errorHolder{err: fmt.Errorf("provider did not return JWKS URL")})
-						return false, nil
-					}
-
-					clientWithJWKSMetrics := *client
-					clientWithJWKSMetrics.Transport = withMetricsRoundTripper(client.Transport, providerJSON.JWKSURL, issuerURL, opts.APIServerID, lifecycleCtx)
-					client = &clientWithJWKSMetrics
-
-					remoteKeySet := oidc.NewRemoteKeySet(oidc.ClientContext(lifecycleCtx, client), providerJSON.JWKSURL)
-					authn.setVerifier(&idTokenVerifier{oidc.NewVerifier(issuerURL, remoteKeySet, verifierConfig), audiences})
-					return true, nil
-				}
-
 				verifier := provider.Verifier(verifierConfig)
 				authn.setVerifier(&idTokenVerifier{verifier, audiences})
 				return true, nil
@@ -470,118 +406,8 @@ func New(lifecycleCtx context.Context, opts Options) (AuthenticatorTokenWithHeal
 	return newInstrumentedAuthenticator(issuerURL, authn), nil
 }
 
-func egressLookupForType(egressLookup egressselector.Lookup, egressSelector egressselector.EgressType) (net.DialFunc, error) {
-	if egressLookup == nil {
-		return nil, fmt.Errorf("oidc: egress lookup required with egress selector type %q", egressSelector)
-	}
-	customDial, err := egressLookup(egressSelector.AsNetworkContext())
-	if err != nil {
-		return nil, fmt.Errorf("oidc: egress lookup for %q failed: %w", egressSelector, err)
-	}
-	// we are stricter than other egress lookups because this is opt-in config
-	// we expect the user who is configuring the JWT authenticator to keep it in sync with the egress configuration
-	if customDial == nil {
-		return nil, fmt.Errorf("oidc: egress lookup for %q is not configured", egressSelector)
-	}
-	return customDial, nil
-}
-
 type errorHolder struct {
 	err error
-}
-
-// metricsRoundTripper is a http.RoundTripper that records metrics for JWKS fetches.
-type metricsRoundTripper struct {
-	base    http.RoundTripper
-	jwksURL string
-
-	jwtIssuer        string
-	apiServerID      string
-	shouldRecordFunc func() bool
-}
-
-// shouldRecordMetrics returns true if metrics should be recorded.
-// This is used to avoid recording metrics after the lifecycle context is done.
-func (m *metricsRoundTripper) shouldRecordMetrics() bool {
-	return m.shouldRecordFunc()
-}
-
-func (m *metricsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.String() != m.jwksURL || !m.shouldRecordMetrics() {
-		return m.base.RoundTrip(req)
-	}
-
-	resp, err := m.base.RoundTrip(req)
-	if err != nil || resp.StatusCode != http.StatusOK || resp.Body == nil {
-		if m.shouldRecordMetrics() {
-			recordJWKSFetchKeySetFailure(m.jwtIssuer, m.apiServerID)
-		}
-		return resp, err
-	}
-
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		if m.shouldRecordMetrics() {
-			recordJWKSFetchKeySetFailure(m.jwtIssuer, m.apiServerID)
-		}
-		return resp, fmt.Errorf("error reading JWKS response: %w", err)
-	}
-
-	// This check has been copied from https://github.com/coreos/go-oidc/blob/0fe98873951208147e6d412602432038c91cda54/oidc/jwks.go#L263-L267
-	// to validate the key set before setting the metrics to avoid recording invalid key sets.
-	var keySet jose.JSONWebKeySet
-	if m.shouldRecordMetrics() {
-		if unmarshalErr := unmarshalResp(resp, body, &keySet); unmarshalErr != nil {
-			recordJWKSFetchKeySetFailure(m.jwtIssuer, m.apiServerID)
-		} else {
-			recordJWKSFetchKeySetSuccess(m.jwtIssuer, m.apiServerID, string(body))
-		}
-	}
-
-	newResp := &http.Response{}
-	*newResp = *resp
-	newResp.Body = io.NopCloser(bytes.NewBuffer(body))
-
-	return newResp, nil
-}
-
-// This function is copied from https://github.com/coreos/go-oidc/blob/0fe98873951208147e6d412602432038c91cda54/oidc/oidc.go#L543-L554
-// to validate the key set before setting the metrics to avoid recording invalid key sets.
-func unmarshalResp(r *http.Response, body []byte, v interface{}) error {
-	err := json.Unmarshal(body, &v)
-	if err == nil {
-		return nil
-	}
-	ct := r.Header.Get("Content-Type")
-	mediaType, _, parseErr := mime.ParseMediaType(ct)
-	if parseErr == nil && mediaType == "application/json" {
-		return fmt.Errorf("got Content-Type = application/json, but could not unmarshal as JSON: %w", err)
-	}
-	return fmt.Errorf("expected Content-Type = application/json, got %q: %w", ct, err)
-}
-
-// withMetricsRoundTripper returns a new http.RoundTripper that records metrics for JWKS fetches.
-func withMetricsRoundTripper(base http.RoundTripper, jwksURL, jwtIssuer, apiServerID string, lifecycleCtx context.Context) http.RoundTripper {
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	return &metricsRoundTripper{
-		base:        base,
-		jwksURL:     jwksURL,
-		jwtIssuer:   jwtIssuer,
-		apiServerID: apiServerID,
-		shouldRecordFunc: func() bool {
-			select {
-			case <-lifecycleCtx.Done():
-				return false
-			default:
-				return true
-			}
-		},
-	}
 }
 
 // discoveryURLRoundTripper is a http.RoundTripper that rewrites the
@@ -882,31 +708,36 @@ func (a *jwtAuthenticator) AuthenticateToken(ctx context.Context, token string) 
 		}
 	}
 
-	var claimsValue *lazy.MapValue
-	// Convert the claims to traits.Mapper so that we can evaluate the CEL expressions
+	var claimsUnstructured *unstructured.Unstructured
+	// Convert the claims to unstructured so that we can evaluate the CEL expressions
 	// against the claims. This is done once here so that we don't have to convert
-	// the claims to traits.Mapper multiple times in the CEL mapper for each mapping.
+	// the claims to unstructured multiple times in the CEL mapper for each mapping.
 	// Only perform this conversion if any of the mapping or validation rules contain
-	// CEL expressions.  The traits.Mapper is lazily evaluated against the expressions.
+	// CEL expressions.
+	// TODO(aramase): In the future when we look into making distributed claims work,
+	// we should see if we can skip this function and use a dynamic type resolver for
+	// both json.RawMessage and the distributed claim fetching.
 	if a.celMapper.Username != nil || a.celMapper.Groups != nil || a.celMapper.UID != nil || a.celMapper.Extra != nil || a.celMapper.ClaimValidationRules != nil {
-		claimsValue = newClaimsValue(c)
+		if claimsUnstructured, err = convertObjectToUnstructured(&c); err != nil {
+			return nil, false, fmt.Errorf("oidc: could not convert claims to unstructured: %w", err)
+		}
 	}
 
 	var username string
-	if username, err = a.getUsername(ctx, c, claimsValue); err != nil {
+	if username, err = a.getUsername(ctx, c, claimsUnstructured); err != nil {
 		return nil, false, err
 	}
 
 	info := &user.DefaultInfo{Name: username}
-	if info.Groups, err = a.getGroups(ctx, c, claimsValue); err != nil {
+	if info.Groups, err = a.getGroups(ctx, c, claimsUnstructured); err != nil {
 		return nil, false, err
 	}
 
-	if info.UID, err = a.getUID(ctx, c, claimsValue); err != nil {
+	if info.UID, err = a.getUID(ctx, c, claimsUnstructured); err != nil {
 		return nil, false, err
 	}
 
-	extra, err := a.getExtra(ctx, c, claimsValue)
+	extra, err := a.getExtra(ctx, c, claimsUnstructured)
 	if err != nil {
 		return nil, false, err
 	}
@@ -931,7 +762,7 @@ func (a *jwtAuthenticator) AuthenticateToken(ctx context.Context, token string) 
 	}
 
 	if a.celMapper.ClaimValidationRules != nil {
-		evalResult, err := a.celMapper.ClaimValidationRules.EvalClaimMappings(ctx, claimsValue)
+		evalResult, err := a.celMapper.ClaimValidationRules.EvalClaimMappings(ctx, claimsUnstructured)
 		if err != nil {
 			return nil, false, fmt.Errorf("oidc: error evaluating claim validation expression: %w", err)
 		}
@@ -947,13 +778,15 @@ func (a *jwtAuthenticator) AuthenticateToken(ctx context.Context, token string) 
 	}
 
 	if a.celMapper.UserValidationRules != nil {
-		// Convert the user info to traits.Mapper so that we can evaluate the CEL expressions
+		// Convert the user info to unstructured so that we can evaluate the CEL expressions
 		// against the user info. This is done once here so that we don't have to convert
-		// the user info to traits.Mapper multiple times in the CEL mapper for each mapping.
-		// The traits.Mapper is lazily evaluated against the expressions.
-		userInfoVal := newUserInfoValue(info)
+		// the user info to unstructured multiple times in the CEL mapper for each mapping.
+		userInfoUnstructured, err := convertUserInfoToUnstructured(info)
+		if err != nil {
+			return nil, false, fmt.Errorf("oidc: could not convert user info to unstructured: %w", err)
+		}
 
-		evalResult, err := a.celMapper.UserValidationRules.EvalUser(ctx, userInfoVal)
+		evalResult, err := a.celMapper.UserValidationRules.EvalUser(ctx, userInfoUnstructured)
 		if err != nil {
 			return nil, false, fmt.Errorf("oidc: error evaluating user info validation rule: %w", err)
 		}
@@ -979,9 +812,9 @@ func (a *jwtAuthenticator) HealthCheck() error {
 	return nil
 }
 
-func (a *jwtAuthenticator) getUsername(ctx context.Context, c claims, claimsValue *lazy.MapValue) (string, error) {
+func (a *jwtAuthenticator) getUsername(ctx context.Context, c claims, claimsUnstructured *unstructured.Unstructured) (string, error) {
 	if a.celMapper.Username != nil {
-		evalResult, err := a.celMapper.Username.EvalClaimMapping(ctx, claimsValue)
+		evalResult, err := a.celMapper.Username.EvalClaimMapping(ctx, claimsUnstructured)
 		if err != nil {
 			return "", fmt.Errorf("oidc: error evaluating username claim expression: %w", err)
 		}
@@ -1027,7 +860,7 @@ func (a *jwtAuthenticator) getUsername(ctx context.Context, c claims, claimsValu
 	return username, nil
 }
 
-func (a *jwtAuthenticator) getGroups(ctx context.Context, c claims, claimsValue *lazy.MapValue) ([]string, error) {
+func (a *jwtAuthenticator) getGroups(ctx context.Context, c claims, claimsUnstructured *unstructured.Unstructured) ([]string, error) {
 	groupsClaim := a.jwtAuthenticator.ClaimMappings.Groups.Claim
 	if len(groupsClaim) > 0 {
 		if _, ok := c[groupsClaim]; ok {
@@ -1055,7 +888,7 @@ func (a *jwtAuthenticator) getGroups(ctx context.Context, c claims, claimsValue 
 		return nil, nil
 	}
 
-	evalResult, err := a.celMapper.Groups.EvalClaimMapping(ctx, claimsValue)
+	evalResult, err := a.celMapper.Groups.EvalClaimMapping(ctx, claimsUnstructured)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: error evaluating group claim expression: %w", err)
 	}
@@ -1067,7 +900,7 @@ func (a *jwtAuthenticator) getGroups(ctx context.Context, c claims, claimsValue 
 	return groups, nil
 }
 
-func (a *jwtAuthenticator) getUID(ctx context.Context, c claims, claimsValue *lazy.MapValue) (string, error) {
+func (a *jwtAuthenticator) getUID(ctx context.Context, c claims, claimsUnstructured *unstructured.Unstructured) (string, error) {
 	uidClaim := a.jwtAuthenticator.ClaimMappings.UID.Claim
 	if len(uidClaim) > 0 {
 		var uid string
@@ -1081,7 +914,7 @@ func (a *jwtAuthenticator) getUID(ctx context.Context, c claims, claimsValue *la
 		return "", nil
 	}
 
-	evalResult, err := a.celMapper.UID.EvalClaimMapping(ctx, claimsValue)
+	evalResult, err := a.celMapper.UID.EvalClaimMapping(ctx, claimsUnstructured)
 	if err != nil {
 		return "", fmt.Errorf("oidc: error evaluating uid claim expression: %w", err)
 	}
@@ -1092,7 +925,7 @@ func (a *jwtAuthenticator) getUID(ctx context.Context, c claims, claimsValue *la
 	return evalResult.EvalResult.Value().(string), nil
 }
 
-func (a *jwtAuthenticator) getExtra(ctx context.Context, c claims, claimsValue *lazy.MapValue) (map[string][]string, error) {
+func (a *jwtAuthenticator) getExtra(ctx context.Context, c claims, claimsUnstructured *unstructured.Unstructured) (map[string][]string, error) {
 	extra := make(map[string][]string)
 
 	if credentialID := getCredentialID(c); len(credentialID) > 0 {
@@ -1103,7 +936,7 @@ func (a *jwtAuthenticator) getExtra(ctx context.Context, c claims, claimsValue *
 		return extra, nil
 	}
 
-	evalResult, err := a.celMapper.Extra.EvalClaimMappings(ctx, claimsValue)
+	evalResult, err := a.celMapper.Extra.EvalClaimMappings(ctx, claimsUnstructured)
 	if err != nil {
 		return nil, err
 	}
@@ -1160,7 +993,7 @@ func getClaimJWT(ctx context.Context, client *http.Client, url, accessToken stri
 	if response.StatusCode < http.StatusOK || response.StatusCode > http.StatusIMUsed {
 		return "", fmt.Errorf("error while getting distributed claim JWT: %v", response.Status)
 	}
-	responseBytes, err := io.ReadAll(response.Body)
+	responseBytes, err := ioutil.ReadAll(response.Body)
 	if err != nil {
 		return "", fmt.Errorf("could not decode distributed claim response")
 	}
@@ -1190,7 +1023,7 @@ func (c claims) unmarshalClaim(name string, v interface{}) error {
 	if !ok {
 		return fmt.Errorf("claim not present")
 	}
-	return json.Unmarshal(val, v)
+	return json.Unmarshal([]byte(val), v)
 }
 
 func (c claims) hasClaim(name string) bool {
@@ -1198,25 +1031,6 @@ func (c claims) hasClaim(name string) bool {
 		return false
 	}
 	return true
-}
-
-func newClaimsValue(c claims) *lazy.MapValue {
-	lazyMap := lazy.NewMapValue(types.NewObjectType("kubernetes.claims"))
-	for name, msg := range c { // TODO add distributed claims support
-		lazyMap.Append(name, func(_ *lazy.MapValue) ref.Val {
-			data, err := msg.MarshalJSON()
-			if err != nil {
-				return types.WrapErr(err) // impossible since RawMessage never errors
-			}
-
-			var value any // TODO how do we do multiple levels of lazy decoding?
-			if err := json.Unmarshal(data, &value); err != nil {
-				return types.NewErr("claim %q failed to unmarshal: %w", name, err)
-			}
-			return nativeToValueWithUnescape(value)
-		})
-	}
-	return lazyMap
 }
 
 // convertCELValueToStringList converts the CEL value to a string list.
@@ -1299,72 +1113,50 @@ func checkValidationRulesEvaluation(results []authenticationcel.EvaluationResult
 	return nil
 }
 
-func newUserInfoValue(info user.Info) *lazy.MapValue {
-	lazyMap := lazy.NewMapValue(types.NewObjectType("kubernetes.UserInfo"))
-	field := func(name string, get func() any) {
-		lazyMap.Append(name, func(_ *lazy.MapValue) ref.Val {
-			value := get()
-			return nativeToValueWithUnescape(value)
-		})
+func convertObjectToUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
+	if obj == nil || reflect.ValueOf(obj).IsNil() {
+		return &unstructured.Unstructured{Object: nil}, nil
 	}
-	field("username", func() any { return info.GetName() })
-	field("uid", func() any { return info.GetUID() })
-	field("groups", func() any { return info.GetGroups() })
-	field("extra", func() any { return info.GetExtra() })
-	return lazyMap
-}
-
-func nativeToValueWithUnescape(value any) ref.Val {
-	return unescapeWrapper(types.DefaultTypeAdapter.NativeToValue(value))
-}
-
-type unescapeMapper struct {
-	traits.Mapper
-}
-
-func (m *unescapeMapper) Find(key ref.Val) (ref.Val, bool) {
-	name, ok := unescapedName(key)
-	if ok {
-		key = name
+	ret, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return nil, err
 	}
-	value, ok := m.Mapper.Find(key)
-	return unescapeWrapper(value), ok
+	return &unstructured.Unstructured{Object: ret}, nil
 }
 
-type unescapeLister struct {
-	traits.Lister
-}
-
-func (l *unescapeLister) Get(index ref.Val) ref.Val {
-	return unescapeWrapper(l.Lister.Get(index))
-}
-
-// unescapeWrapper handles __dot__ based field access for native types that are converted into CEL values.
-// This means we need to handle map lookups for our native types (the claims JSON and the user info data).
-// User info is straightforward since it just has a single map field that needs the __dot__ support.  The
-// claims JSON is more complicated because maps can appear in deeply nested fields.  This means that we need
-// to account for both nested JSON objects and nested JSON arrays in all contexts where we return a CEL value.
-// It is safe to pass any CEL value to this function, including nil (i.e. the caller can skip error checking).
-func unescapeWrapper(value ref.Val) ref.Val {
-	switch v := value.(type) {
-	case traits.Mapper:
-		return &unescapeMapper{Mapper: v} // handle nested JSON objects
-	case traits.Lister:
-		return &unescapeLister{Lister: v} // handle nested JSON arrays
-	default:
-		return value
+func convertUserInfoToUnstructured(info user.Info) (*unstructured.Unstructured, error) {
+	userInfo := &authenticationv1.UserInfo{
+		Extra:    make(map[string]authenticationv1.ExtraValue),
+		Groups:   info.GetGroups(),
+		UID:      info.GetUID(),
+		Username: info.GetName(),
 	}
-}
+	// Convert the extra information in the user object
+	for key, val := range info.GetExtra() {
+		userInfo.Extra[key] = authenticationv1.ExtraValue(val)
+	}
 
-func unescapedName(key ref.Val) (types.String, bool) {
-	n, ok := key.(types.String)
-	if !ok {
-		return "", false
+	// Convert the user info to unstructured so that we can evaluate the CEL expressions
+	// against the user info. This is done once here so that we don't have to convert
+	// the user info to unstructured multiple times in the CEL mapper for each mapping.
+	userInfoUnstructured, err := convertObjectToUnstructured(userInfo)
+	if err != nil {
+		return nil, err
 	}
-	ns := string(n)
-	name, ok := cel.Unescape(ns)
-	if !ok || name == ns {
-		return "", false
+
+	// check if the user info contains the required fields. If not, set them to empty values.
+	// This is done because the CEL expressions expect these fields to be present.
+	if userInfoUnstructured.Object["username"] == nil {
+		userInfoUnstructured.Object["username"] = ""
 	}
-	return types.String(name), true
+	if userInfoUnstructured.Object["uid"] == nil {
+		userInfoUnstructured.Object["uid"] = ""
+	}
+	if userInfoUnstructured.Object["groups"] == nil {
+		userInfoUnstructured.Object["groups"] = []string{}
+	}
+	if userInfoUnstructured.Object["extra"] == nil {
+		userInfoUnstructured.Object["extra"] = map[string]authenticationv1.ExtraValue{}
+	}
+	return userInfoUnstructured, nil
 }
