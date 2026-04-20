@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -70,11 +69,12 @@ func (a *APIServer) createFlash(c *gin.Context) {
 		req.Name = fmt.Sprintf("flash-%s", uuid.New().String()[:5])
 	}
 
-	// Validate name
+	// Validate and sanitize name for Kubernetes compatibility
 	if err := validateBuildName(req.Name); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	req.Name = sanitizeBuildNameForValidation(req.Name)
 
 	// Validate mutual exclusivity of lease-name and lease-duration
 	if req.LeaseName != "" && req.LeaseDuration != "" {
@@ -233,14 +233,16 @@ func (a *APIServer) createFlash(c *gin.Context) {
 	}
 	createdSecret.OwnerReferences = ownerRef
 	if _, err := clientset.CoreV1().Secrets(namespace).Update(ctx, createdSecret, metav1.UpdateOptions{}); err != nil {
-		log.Printf("WARNING: failed to set owner reference on secret %s: %v", secretName, err)
+		a.log.Error(err, "failed to set owner reference on secret", "secret", secretName)
 	}
 	if createdOCIAuthSecret != nil {
 		createdOCIAuthSecret.OwnerReferences = ownerRef
 		if _, updErr := clientset.CoreV1().Secrets(namespace).Update(ctx, createdOCIAuthSecret, metav1.UpdateOptions{}); updErr != nil {
-			log.Printf("WARNING: failed to set owner reference on flash OCI auth secret %s: %v", flashOCIAuthSecretName, updErr)
+			a.log.Error(updErr, "failed to set owner reference on flash OCI auth secret", "secret", flashOCIAuthSecretName)
 		}
 	}
+
+	FlashCreatedTotal.Inc()
 
 	writeJSON(c, http.StatusAccepted, FlashResponse{
 		Name:        req.Name,
@@ -349,6 +351,9 @@ func getTaskRunStatus(tr *tektonv1.TaskRun) (phase, message string) {
 				if cond.Status == corev1.ConditionTrue {
 					return phaseCompleted, "Flash completed successfully"
 				}
+				if cond.Message == "" {
+					return phaseFailed, "Flash failed"
+				}
 				return phaseFailed, cond.Message
 			}
 		}
@@ -416,17 +421,31 @@ func (a *APIServer) streamFlashLogs(c *gin.Context, name string) {
 	// TaskRun pods use step containers with naming convention "step-<step-name>"
 	containerName := "step-flash"
 
-	// Stream logs
-	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+	// Stream logs, retrying while the container is still initializing
+	logReq := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
 		Container: containerName,
 		Follow:    true,
 		SinceTime: sinceTime,
 	})
-	stream, err := req.Stream(streamCtx)
-	if err != nil {
-		_, _ = fmt.Fprintf(c.Writer, "\n[Error streaming logs: %v]\n", err)
-		c.Writer.Flush()
-		return
+	var stream io.ReadCloser
+	for {
+		stream, err = logReq.Stream(streamCtx)
+		if err == nil {
+			break
+		}
+		pod, getErr := clientset.CoreV1().Pods(namespace).Get(streamCtx, podName, metav1.GetOptions{})
+		if getErr != nil || !isPodInitializing(pod) {
+			_, _ = fmt.Fprintf(c.Writer, "\n[Error streaming logs: %v]\n", err)
+			c.Writer.Flush()
+			return
+		}
+		select {
+		case <-streamCtx.Done():
+			_, _ = fmt.Fprintf(c.Writer, "\n[Timed out waiting for container]\n")
+			c.Writer.Flush()
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	defer func() {
 		if err := stream.Close(); err != nil {
@@ -465,4 +484,24 @@ func (a *APIServer) streamFlashLogs(c *gin.Context, name string) {
 
 	_, _ = c.Writer.Write([]byte("\n[Log streaming completed]\n"))
 	c.Writer.Flush()
+}
+
+func isPodInitializing(pod *corev1.Pod) bool {
+	if pod.Status.Phase == corev1.PodPending {
+		return true
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil {
+			switch cs.State.Waiting.Reason {
+			case "ContainerCreating", "PodInitializing":
+				return true
+			}
+		}
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.State.Running != nil || cs.State.Waiting != nil {
+			return true
+		}
+	}
+	return false
 }

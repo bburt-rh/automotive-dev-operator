@@ -549,6 +549,8 @@ func (a *APIServer) createRouter() *gin.Engine {
 		c.Next()
 	})
 
+	router.GET("/metrics", metricsHandler())
+
 	v1 := router.Group("/v1")
 	{
 		v1.GET("/healthz", func(c *gin.Context) {
@@ -578,7 +580,7 @@ func (a *APIServer) createRouter() *gin.Engine {
 		}
 
 		flashGroup := v1.Group("/flash")
-		flashGroup.Use(a.authMiddleware())
+		flashGroup.Use(flashMetricsMiddleware(), a.authMiddleware())
 		{
 			flashGroup.POST("", a.handleCreateFlash)
 			flashGroup.GET("", a.handleListFlash)

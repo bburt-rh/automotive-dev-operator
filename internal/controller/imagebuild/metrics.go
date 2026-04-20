@@ -48,6 +48,29 @@ var (
 		},
 		[]string{"mode", "distro", "target", "format", "arch", "status"},
 	)
+
+	// FlashTotal counts pipeline-triggered flash operations by status.
+	FlashTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "flash",
+			Name:      "total",
+			Help:      "Total number of pipeline flash operations by status",
+		},
+		[]string{"target", "status"},
+	)
+
+	// FlashDuration tracks pipeline flash duration in seconds.
+	FlashDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: "flash",
+			Name:      "duration_seconds",
+			Help:      "Pipeline flash operation duration in seconds",
+			Buckets:   []float64{10, 30, 60, 120, 180, 300, 600, 900},
+		},
+		[]string{"target", "status"},
+	)
 )
 
 func init() {
@@ -55,5 +78,7 @@ func init() {
 		BuildDuration,
 		BuildPhaseDuration,
 		BuildTotal,
+		FlashTotal,
+		FlashDuration,
 	)
 }
