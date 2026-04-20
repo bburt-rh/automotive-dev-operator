@@ -45,12 +45,11 @@ check_prerequisites() {
 
 update_version() {
     local version=$1
-    log_info "Updating VERSION to $version in Makefile..."
+    log_info "Updating VERSION file to $version..."
 
-    sed -i.bak "s/^VERSION ?= .*/VERSION ?= $version/" "$ROOT_DIR/Makefile"
-    rm -f "$ROOT_DIR/Makefile.bak"
+    echo "$version" > "$ROOT_DIR/VERSION"
 
-    log_success "Version updated in Makefile"
+    log_success "Version updated in VERSION file"
 }
 
 generate_bundle() {
@@ -138,13 +137,12 @@ bump_dev_version() {
 
     log_info "Bumping version to $dev_version for next development cycle..."
 
-    sed -i.bak "s/^VERSION ?= .*/VERSION ?= $dev_version/" "$ROOT_DIR/Makefile"
-    rm -f "$ROOT_DIR/Makefile.bak"
+    echo "$dev_version" > "$ROOT_DIR/VERSION"
 
-    log_success "Version bumped to $dev_version in Makefile"
+    log_success "Version bumped to $dev_version in VERSION file"
     echo ""
     log_info "Commit this change on main after tagging the release:"
-    echo "  git add Makefile"
+    echo "  git add VERSION"
     echo "  git commit -m 'chore: bump version to $dev_version for next development cycle'"
 }
 
@@ -252,7 +250,7 @@ main() {
     echo "  3. Push: git push origin main --tags"
     echo "  4. GitHub Actions will build and publish images"
     echo "  5. Submit PR to community-operators-prod"
-    echo "  6. Bump to next dev version: $0 post-release $version"
+    echo "  6. Post-release version bump PR will be created automatically by CI"
     echo ""
 }
 

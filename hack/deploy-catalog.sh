@@ -110,8 +110,9 @@ if [ "$COMMAND" != "build" ] && [ "$SKIP_CONFIRM" = false ]; then
     fi
 fi
 
-# Configuration
-VERSION=${VERSION:-0.0.1}
+# Configuration — read default from VERSION file
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION=${VERSION:-$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "0.0.0")}
 NAMESPACE=${NAMESPACE:-automotive-dev-operator-system}
 CATALOG_NAME=${CATALOG_NAME:-automotive-dev-operator-catalog}
 
