@@ -722,6 +722,13 @@ spec:
                       Required for bootc builds to allow nested containers to pull builder images
                       Example: "default-route-openshift-image-registry.apps.mycluster.example.com"
                     type: string
+                  defaultBuildTTL:
+                    description: |-
+                      DefaultBuildTTL is the default time-to-live for builds (all phases, including in-progress).
+                      Builds are automatically deleted after this duration. Uses Go duration format (e.g. "24h", "72h").
+                      Set to "0" to disable expiry by default.
+                      Default: "24h"
+                    type: string
                   enabled:
                     default: true
                     description: Enabled determines if Tekton tasks for OS builds
@@ -733,6 +740,12 @@ spec:
                       Default: 240 (4 hours)
                     format: int32
                     type: integer
+                  maxBuildTTL:
+                    description: |-
+                      MaxBuildTTL is the maximum TTL that users can request for individual builds.
+                      Build requests specifying a TTL greater than this value are rejected.
+                      Set to "0" for no maximum. Uses Go duration format (e.g. "168h" for 1 week).
+                    type: string
                   memoryVolumeSize:
                     description: |-
                       MemoryVolumeSize specifies the size limit for memory-backed volumes

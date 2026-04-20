@@ -144,6 +144,9 @@ type BuildRequest struct {
 	// Secure build: resolve tasks from signed Tekton Bundle
 	SecureBuild bool `json:"secureBuild,omitempty"`
 
+	// TTL is the time-to-live for the build. Empty uses server default, "0" disables expiry.
+	TTL string `json:"ttl,omitempty"`
+
 	// Flash configuration for Jumpstarter device flashing after build
 	FlashEnabled          bool   `json:"flashEnabled,omitempty"`          // Enable flashing after build
 	FlashClientConfig     string `json:"flashClientConfig,omitempty"`     // Base64-encoded Jumpstarter client config
@@ -231,6 +234,7 @@ type BuildResponse struct {
 	DiskImage      string           `json:"diskImage,omitempty"`
 	RegistryToken  string           `json:"registryToken,omitempty"`
 	Warning        string           `json:"warning,omitempty"`
+	ExpiresAt      string           `json:"expiresAt,omitempty"`
 	Jumpstarter    *JumpstarterInfo `json:"jumpstarter,omitempty"`
 	Parameters     *BuildParameters `json:"parameters,omitempty"`
 }

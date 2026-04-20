@@ -93,6 +93,13 @@ type ImageBuildSpec struct {
 	// OperatorConfig at request time to prevent TOCTOU races.
 	// +optional
 	TaskBundleRef string `json:"taskBundleRef,omitempty"`
+
+	// TTL is the time-to-live for this build. The build is automatically deleted
+	// after this duration past its completion (or creation if still in progress).
+	// Uses Go duration format (e.g. "24h", "72h", "168h").
+	// Empty uses the OperatorConfig default. Set to "0" to disable expiry.
+	// +optional
+	TTL string `json:"ttl,omitempty"`
 }
 
 // FlashSpec defines configuration for flashing images to hardware via Jumpstarter
@@ -256,6 +263,11 @@ type ImageBuildStatus struct {
 	// LeaseID is the Jumpstarter lease ID acquired during flash
 	// +optional
 	LeaseID string `json:"leaseId,omitempty"`
+
+	// ExpiresAt is when this build will be automatically deleted.
+	// Nil if expiry is disabled (TTL "0" or no-expire annotation).
+	// +optional
+	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -510,4 +522,9 @@ func (s *ImageBuildSpec) GetFlashLeaseName() string {
 		return s.Flash.LeaseName
 	}
 	return ""
+}
+
+// GetTTL returns the per-build TTL string, or empty if not set
+func (s *ImageBuildSpec) GetTTL() string {
+	return s.TTL
 }
