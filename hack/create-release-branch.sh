@@ -40,7 +40,7 @@ Examples:
 What this script does:
 1. Validates the version format
 2. Creates release-X.Y.x branch from main
-3. Updates the Makefile VERSION
+3. Updates the VERSION file
 4. Creates an initial commit
 5. Pushes the branch to origin
 6. Creates a git tag for the version
@@ -133,28 +133,22 @@ fi
 log_info "Creating release branch: $RELEASE_BRANCH"
 git checkout -b "$RELEASE_BRANCH"
 
-# Update VERSION in Makefile
-log_info "Updating VERSION in Makefile to $VERSION"
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS sed syntax
-    sed -i '' "s/^VERSION ?= .*/VERSION ?= $VERSION/" Makefile
-else
-    # Linux sed syntax
-    sed -i "s/^VERSION ?= .*/VERSION ?= $VERSION/" Makefile
-fi
+# Update VERSION file
+log_info "Updating VERSION file to $VERSION"
+echo "$VERSION" > VERSION
 
 # Verify the change
-if ! grep -q "VERSION ?= $VERSION" Makefile; then
-    log_error "Failed to update VERSION in Makefile"
+if [[ "$(cat VERSION)" != "$VERSION" ]]; then
+    log_error "Failed to update VERSION file"
     exit 1
 fi
 
 # Commit the version update
 log_info "Committing version update..."
-git add Makefile
+git add VERSION
 git commit -m "Release $VERSION
 
-- Update VERSION in Makefile to $VERSION
+- Update VERSION file to $VERSION
 - Prepare for $VERSION release"
 
 # Create and push the branch
@@ -174,7 +168,7 @@ echo "1. The GitHub Actions will now build and release v$VERSION"
 echo "2. Monitor the release workflow: https://github.com/$(git config remote.origin.url | sed 's/.*github.com[:/]\([^.]*\).*/\1/')/actions"
 echo "3. For patch releases (${MAJOR}.${MINOR}.X+1):"
 echo "   - Cherry-pick fixes to $RELEASE_BRANCH"
-echo "   - Update VERSION in Makefile"
+echo "   - Update VERSION file"
 echo "   - Tag the new patch version"
 echo ""
 echo "Current branch: $RELEASE_BRANCH"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime/debug"
 	"strings"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/authcmd"
@@ -19,11 +20,27 @@ var validOutputFormats = map[string]bool{
 	"yml":   true,
 }
 
+func fullVersion() string {
+	v := version
+	if v == "" {
+		v = "dev"
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+				v += " (" + s.Value[:7] + ")"
+				break
+			}
+		}
+	}
+	return v
+}
+
 func newRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:     "caib",
 		Short:   "Cloud Automotive Image Builder",
-		Version: version,
+		Version: fullVersion(),
 		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
 			f := strings.ToLower(strings.TrimSpace(outputFormat))
 			if !validOutputFormats[f] {

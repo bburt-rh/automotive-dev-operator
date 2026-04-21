@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-VERSION=${VERSION:-0.0.1}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION=${VERSION:-$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "0.0.0")}
 NAMESPACE=${NAMESPACE:-openshift-marketplace}
 
 echo "Detecting OpenShift internal registry..."
